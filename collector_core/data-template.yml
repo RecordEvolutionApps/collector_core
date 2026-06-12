@@ -1,0 +1,197 @@
+# yaml-language-server: $schema=https://gist.githubusercontent.com/markope/80d99a0bb28cd602cc4a0af790086163/raw/ironflock-data-template-schema.yml
+#
+# CANONICAL CORE TABLE CONTRACT for IronFlock collector apps
+# ----------------------------------------------------------
+# This file is NOT imported at runtime. It documents the data structure that
+# every collector app built on collector_core must provide in its own
+# .ironflock/data-template.yml: the five tables below with exactly these core
+# columns. Apps EXTEND the tables with protocol-specific columns (connection
+# parameters on `assets`, address/decode metadata on `datapoints`, gateway
+# settings on `gateways`) but must not remove or repurpose the core columns.
+#
+# Conventions:
+# - `tsp` is mandatory on every table (platform requirement).
+# - Identity keys (maintainLatestFlagFor) must match exactly: rows are
+#   semantically updated by appending with the same key columns.
+# - Secrets (passwords, certificates) never go into tables — use device
+#   environment or mounted volumes instead.
+# - chunkTimeInterval / dropAfter are deployment-tunable defaults.
+
+data:
+  tables:
+    # The edge PCs (gateways) this app runs on: registry written by the core
+    # at startup (echo-merging existing columns) + per-gateway settings
+    # edited by users. Apps add their own settings columns (e.g. scan
+    # intervals, protocol identities).
+    - tablename: gateways
+      chunkTimeInterval: 1 year
+      maintainLatestFlagFor: [gateway_name]
+      columns:
+        - id: tsp
+          name: Timestamp
+          description: Timestamp of data entry
+          dataType: timestamp
+        - id: gateway_name
+          name: Gateway Name
+          description: Name of the gateway (edge PC) this app runs on
+          dataType: string
+        - id: deleted
+          name: Deleted Flag
+          description: Marks a gateway as deleted
+          dataType: boolean
+        - id: store_data
+          name: Store Data
+          description: If false, the app reads its configuration but writes no collected data (forward-only mode). Missing/null means true.
+          dataType: boolean
+        - id: info
+          name: Info
+          description: Additional gateway information (JSON), e.g. runtime details written by the app. Open for future extension.
+          dataType: json
+
+    # The connected protocol endpoints (machines, controllers, servers,
+    # masters) reachable from a gateway. One row per asset; identity is
+    # (gateway_id, asset_name) — a rename creates a new asset. Apps add
+    # connection parameter columns (host, port, endpoint_url, ...).
+    - tablename: assets
+      chunkTimeInterval: 1 hour
+      dropAfter: 3 year
+      maintainLatestFlagFor: ['gateway_id', 'asset_name']
+      columns:
+        - id: tsp
+          name: Timestamp
+          description: Timestamp of data entry
+          dataType: timestamp
+        - id: asset_name
+          name: Asset Name
+          description: Name of the asset. Immutable identity together with the gateway.
+          dataType: string
+        - id: gateway_id
+          name: Gateway ID
+          description: Joins on device_key in the gateways table.
+          dataType: numeric
+        - id: datapoint_spec
+          name: Datapoint Spec
+          description: Protocol-defined selection/decode specification of the datapoints to collect. Empty means collect everything discoverable.
+          dataType: string
+        - id: collect_interval
+          name: Collect Interval
+          description: Seconds between collected batches - poll period for polled protocols, publish window for subscription/streaming protocols.
+          dataType: numeric
+        - id: enabled
+          name: Enabled
+          description: Pause/run switch. Only an explicit false pauses collection; missing/null means running.
+          dataType: boolean
+        - id: demo_mode
+          name: Demo Mode
+          description: If true, the asset produces synthetic demo data instead of reading the real device.
+          dataType: boolean
+        - id: deleted
+          name: Deleted Flag
+          description: Deleted Flag
+          dataType: boolean
+        # Optional convention for apps with network discovery:
+        # - id: auto_registered
+        #   name: Auto Registered
+        #   description: True if this asset was created by the network scan rather than by a user.
+        #   dataType: boolean
+
+    # The catalog of single value streams per asset, discovered by the
+    # protocol or derived from the datapoint_spec; maintained automatically
+    # (upsert + soft-delete). Apps add protocol metadata columns (register
+    # offset, object type, node class, port/sensor identity, ...).
+    - tablename: datapoints
+      chunkTimeInterval: 1 hour
+      dropAfter: 3 months
+      maintainLatestFlagFor: ['gateway_id', 'asset_name', 'datapoint_id']
+      columns:
+        - id: tsp
+          name: Timestamp
+          description: Timestamp of data entry
+          dataType: timestamp
+        - id: datapoint_id
+          name: Datapoint ID
+          description: Protocol-defined identifier of the value stream, unique per asset.
+          dataType: string
+        - id: asset_name
+          name: Asset Name
+          description: Name of the asset this datapoint belongs to
+          dataType: string
+        - id: gateway_id
+          name: Gateway ID
+          description: Joins on device_key in the gateways table.
+          dataType: numeric
+        - id: name
+          name: Name
+          description: Human readable name of the datapoint
+          dataType: string
+        - id: units
+          name: Units
+          description: Engineering units of the datapoint
+          dataType: string
+        - id: path
+          name: Path
+          description: Hierarchical locator of the datapoint within the asset (protocol-defined, e.g. port3, slot2/subslot1, Objects/Boiler1, Axes/X). Empty for flat protocols.
+          dataType: string
+        - id: deleted
+          name: Deleted Flag
+          description: Deleted Flag
+          dataType: boolean
+
+    # The actual timeseries recordings: one row per asset per collected
+    # batch. `data` holds one entry per datapoint with the standard shape
+    # {name, units, value} plus optional protocol extras (status, source_tsp,
+    # ...). Rows are snapshots: a row contains the full current state of the
+    # asset (push protocols merge last-known values per window).
+    - tablename: measurements
+      chunkTimeInterval: 2 day
+      dropAfter: 3 months
+      columns:
+        - id: tsp
+          name: Timestamp
+          description: Timestamp of the collected batch
+          dataType: timestamp
+        - id: asset_name
+          name: Asset Name
+          description: Name of the asset
+          dataType: string
+        - id: gateway_id
+          name: Gateway ID
+          description: Joins on device_key in the gateways table.
+          dataType: numeric
+        - id: data
+          name: Data
+          description: 'Collected readings as JSON: {datapoint_id: {name, units, value, ...extras}}'
+          dataType: json
+
+    # Asset state transitions written by the core (online | offline |
+    # paused): latest row per asset = current state, full history =
+    # availability log. Fully core-owned; no protocol columns.
+    - tablename: assetstatus
+      chunkTimeInterval: 1 month
+      dropAfter: 3 months
+      maintainLatestFlagFor: ['gateway_id', 'asset_name']
+      columns:
+        - id: tsp
+          name: Timestamp
+          description: Timestamp of the state transition
+          dataType: timestamp
+        - id: asset_name
+          name: Asset Name
+          description: Name of the asset
+          dataType: string
+        - id: gateway_id
+          name: Gateway ID
+          description: Joins on device_key in the gateways table.
+          dataType: numeric
+        - id: status
+          name: Status
+          description: online | offline | paused
+          dataType: string
+        - id: detail
+          name: Detail
+          description: Error text for offline transitions, empty otherwise
+          dataType: string
+        - id: deleted
+          name: Deleted Flag
+          description: Deleted Flag
+          dataType: boolean

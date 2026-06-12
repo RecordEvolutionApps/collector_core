@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ironflock-collector-core"
+version = "2.0.0"
+description = "Protocol-agnostic collector core for IronFlock data collector apps"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Record Evolution GmbH" }]
+# Intentionally zero dependencies: the core never imports the ironflock SDK
+# (the handle is injected by the app's main.py).
+dependencies = []
+
+[tool.setuptools]
+packages = ["collector_core"]
+
+[tool.setuptools.package-data]
+collector_core = ["data-template.yml"]

@@ -43,6 +43,10 @@ data:
           name: Store Data
           description: If false, the app reads its configuration but writes no collected data (forward-only mode). Missing/null means true.
           dataType: boolean
+        - id: buffer_size
+          name: Buffer Size
+          description: Max number of data rows to buffer locally while the cloud link is down; flushed in order on reconnect. Oldest dropped when full. Missing/null uses the app default.
+          dataType: numeric
         - id: info
           name: Info
           description: Additional gateway information (JSON), e.g. runtime details written by the app. Open for future extension.

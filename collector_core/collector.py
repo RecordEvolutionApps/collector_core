@@ -16,10 +16,18 @@ configuration is still read live from the platform.
 import asyncio
 import sys
 import traceback
+from collections import deque
 from contextlib import aclosing
 from datetime import datetime, timezone
 
 from collector_core.adapter import PLATFORM_COLUMNS, DatapointStore, DatapointsChanged
+
+# Max data rows buffered locally while the cloud link is down, when the
+# gateway row sets no buffer_size. Oldest rows are dropped on overflow.
+DEFAULT_BUFFER_SIZE = 10000
+
+# How often the background flusher retries draining the buffer (seconds).
+FLUSH_INTERVAL = 15
 
 
 def _now():
@@ -41,6 +49,10 @@ class Collector:
         self.gateway = {}
         self.asset_tasks: dict[str, asyncio.Task] = {}
         self._asset_status: dict[str, str] = {}
+        # Bounded FIFO of (table, payload) writes that could not be sent while
+        # the cloud link was down; drained in order on reconnect.
+        self._buffer = deque(maxlen=DEFAULT_BUFFER_SIZE)
+        self._flush_lock = asyncio.Lock()
 
     def set_ironflock(self, ironflock):
         """Provide the IronFlock handle used for all table I/O. Must be called
@@ -54,6 +66,18 @@ class Collector:
         self.store_data = self._default_store_data if value is None else bool(value)
         if self.store is not None:
             self.store.store_data = self.store_data
+        self._apply_buffer_size(row.get("buffer_size"))
+
+    def _apply_buffer_size(self, value):
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            size = DEFAULT_BUFFER_SIZE
+        if size < 1:
+            size = DEFAULT_BUFFER_SIZE
+        if size != self._buffer.maxlen:
+            # Resize, keeping the newest rows (deque drops the oldest overflow).
+            self._buffer = deque(self._buffer, maxlen=size)
 
     async def load_gateway(self):
         """Load this gateway's own row (registry + per-gateway settings)."""
@@ -126,8 +150,7 @@ class Collector:
             "deleted": False,
         }
         print("asset status:", row)
-        if self.store_data:
-            await self.ironflock.append_to_table("assetstatus", row)
+        await self._send("assetstatus", row)
 
     async def clear_asset_status(self, asset):
         """Soft-delete the status stream of a removed asset."""
@@ -141,8 +164,7 @@ class Collector:
             "detail": "asset deleted",
             "deleted": True,
         }
-        if self.store_data:
-            await self.ironflock.append_to_table("assetstatus", row)
+        await self._send("assetstatus", row)
 
     # ------------------------------------------------------------------ config
 
@@ -321,6 +343,54 @@ class Collector:
         self.stop_asset_task(name)
         self.asset_tasks[name] = asyncio.create_task(self.collect_asset(asset))
 
+    # ---------------------------------------------------------- outbound writes
+
+    async def _send(self, table, payload):
+        """Write a data row to the platform, buffering it if the link is down.
+
+        The single write path for the live data streams (measurements,
+        assetstatus). Forward-only gateways (``store_data`` False) drop the
+        row. Otherwise the row is appended to the bounded buffer and an
+        opportunistic flush is attempted; a network failure leaves the row
+        (and any backlog) buffered for the next flush instead of raising, so
+        collection keeps running during a cloud outage.
+        """
+        if not self.store_data:
+            return
+        self._buffer.append((table, payload))
+        await self._flush()
+
+    async def _flush(self):
+        """Drain the buffer oldest-first while the link is up.
+
+        Bounded to the current length so concurrently appended rows can't
+        livelock the drain. Stops at the first failure, keeping the backlog.
+        """
+        async with self._flush_lock:
+            for _ in range(len(self._buffer)):
+                if not self._buffer:
+                    break
+                item = self._buffer.popleft()
+                try:
+                    await self.ironflock.append_to_table(*item)
+                except Exception as e:
+                    # Still down: put the row back and keep the backlog.
+                    self._buffer.appendleft(item)
+                    print(f"buffered {len(self._buffer)} row(s); link down: {e}")
+                    return
+
+    async def _flush_loop(self):
+        """Periodically retry draining the buffer, so a backlog is sent on
+        reconnect even when no new data is flowing (device also down, assets
+        paused)."""
+        while True:
+            await asyncio.sleep(FLUSH_INTERVAL)
+            if self._buffer:
+                try:
+                    await self._flush()
+                except Exception as e:
+                    print(f"flush loop error: {e}")
+
     # -------------------------------------------------------------- collection
 
     def _datapoints_provider(self, asset):
@@ -367,8 +437,7 @@ class Collector:
         if not payload["data"]:
             return False
         print(payload)
-        if self.store_data:
-            await self.ironflock.append_to_table("measurements", payload)
+        await self._send("measurements", payload)
         return True
 
     async def collect_asset(self, asset):
@@ -431,6 +500,9 @@ class Collector:
             self.ironflock, self.device_key, datapoints, store_data=self.store_data
         )
         await self.load_asset_configs()
+
+        # Drains the offline buffer on reconnect even when no new data flows.
+        asyncio.create_task(self._flush_loop())
 
         # Table subscriptions are active now, so asset rows appended by
         # protocol background work (e.g. network discovery) are picked up.

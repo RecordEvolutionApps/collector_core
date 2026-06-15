@@ -29,6 +29,10 @@ DEFAULT_BUFFER_SIZE = 10000
 # How often the background flusher retries draining the buffer (seconds).
 FLUSH_INTERVAL = 15
 
+# Max rows per bulk insert, so catching up a large backlog is split into
+# several capped requests instead of one oversized one.
+BULK_CHUNK_MAX = 5000
+
 # Sentinel for "no value seen yet" in the change-detection cache, so a genuine
 # None reading is distinguished from a datapoint that has never been published.
 _UNSET = object()
@@ -381,21 +385,39 @@ class Collector:
     async def _flush(self):
         """Drain the buffer oldest-first while the link is up.
 
-        Bounded to the current length so concurrently appended rows can't
-        livelock the drain. Stops at the first failure, keeping the backlog.
+        Rows are sent with the SDK's bulk ``append_rows_to_table``: the backlog
+        is snapshotted (bounded to the current length so concurrently appended
+        rows can't livelock the drain) and consecutive rows for the same table
+        are written in one call, capped at ``BULK_CHUNK_MAX`` rows so a long
+        backlog is split into several bounded inserts rather than one oversized
+        one. A reconnect after a long outage then catches up in a handful of
+        bulk requests instead of thousands of single-row ones. Stops at the
+        first failure, re-queuing the un-sent rows oldest-first so the backlog
+        (and ordering) is preserved.
         """
         async with self._flush_lock:
+            pending = []
             for _ in range(len(self._buffer)):
                 if not self._buffer:
                     break
-                item = self._buffer.popleft()
+                pending.append(self._buffer.popleft())
+
+            i, n = 0, len(pending)
+            while i < n:
+                table = pending[i][0]
+                j = i
+                rows = []
+                while j < n and pending[j][0] == table and len(rows) < BULK_CHUNK_MAX:
+                    rows.append(pending[j][1])
+                    j += 1
                 try:
-                    await self.ironflock.append_to_table(*item)
+                    await self.ironflock.append_rows_to_table(table, rows)
                 except Exception as e:
-                    # Still down: put the row back and keep the backlog.
-                    self._buffer.appendleft(item)
+                    # Still down: re-queue everything not yet sent, in order.
+                    self._buffer.extendleft(reversed(pending[i:]))
                     print(f"buffered {len(self._buffer)} row(s); link down: {e}")
                     return
+                i = j
 
     async def _flush_loop(self):
         """Periodically retry draining the buffer, so a backlog is sent on

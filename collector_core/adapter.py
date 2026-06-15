@@ -24,6 +24,17 @@ from typing import Any
 # Columns the platform stamps onto rows it returns; never echo them back.
 PLATFORM_COLUMNS = ("tsp", "latest_flag", "authid", "device_key")
 
+# Datapoints columns owned by the user via the board (per-datapoint pause and
+# change detection), not by protocol discovery. The store preserves them across
+# metadata re-discovery so a device-driven catalog rewrite never clobbers a
+# user's choice; the collector reads them to gate measurement writes.
+#  - enabled:          pause switch, null-safe (only an explicit false pauses;
+#                      missing/null means the datapoint is collected).
+#  - change_detection: when true, the datapoint is written only when its value
+#                      differs from the last written value (missing/null/false
+#                      stores every reading).
+USER_DATAPOINT_COLUMNS = ("enabled", "change_detection")
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -101,7 +112,9 @@ class DatapointStore:
         Each payload is a full ``datapoints`` row in the protocol's own schema
         (all columns except ``tsp``) and must contain ``datapoint_id``. Rows
         already present with identical values are skipped, so calling this
-        repeatedly is cheap.
+        repeatedly is cheap. User-owned columns (``USER_DATAPOINT_COLUMNS``)
+        are carried over from the existing row, so re-discovering metadata never
+        clobbers a user's pause / change-detection choice.
         """
         stored = 0
         for payload in payloads:
@@ -120,6 +133,12 @@ class DatapointStore:
                 continue
 
             record = {**payload, "tsp": _now()}
+            # Preserve user-set columns the protocol does not manage across a
+            # metadata-driven rewrite (the payload never carries them).
+            if current is not None:
+                for column in USER_DATAPOINT_COLUMNS:
+                    if column not in record and current.get(column) is not None:
+                        record[column] = current[column]
             print("storing datapoint", record)
             if self.store_data:
                 await self._ironflock.append_to_table("datapoints", record)

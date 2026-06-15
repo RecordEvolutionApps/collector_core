@@ -32,7 +32,7 @@ the core columns and may extend them with protocol-specific columns.
 |---|---|---|---|
 | `gateways` | registry + per-gateway settings | gateway_name | tsp, gateway_name, deleted, store_data, info (json) |
 | `assets` | connected protocol endpoints | gateway_id, asset_name | tsp, asset_name, gateway_id, datapoint_spec, collect_interval, enabled, demo_mode, deleted |
-| `datapoints` | value-stream catalog per asset | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, deleted |
+| `datapoints` | value-stream catalog per asset | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, enabled, change_detection, deleted |
 | `measurements` | timeseries recordings | — (append-only) | tsp, asset_name, gateway_id, data (json) |
 | `assetstatus` | state transitions (core-owned) | gateway_id, asset_name | tsp, asset_name, gateway_id, status, detail, deleted |
 
@@ -47,10 +47,22 @@ Key semantics:
 - **assets.datapoint_spec** — protocol-defined selection/decode spec
   (MTConnect/BACnet/OPC UA: id filter list; Modbus/Profinet: authored
   register/record map in YAML). Empty = collect everything discoverable.
+- **datapoints.enabled / datapoints.change_detection** — per-datapoint write
+  gating applied by the core in `_publish_batch`, read live from the catalog
+  so board edits take effect on the next cycle (no asset restart, no adapter
+  change). `enabled` is the null-safe pause switch (only an explicit `false`
+  drops the datapoint from every row, mirroring `assets.enabled`).
+  `change_detection` writes the datapoint only when its `value` differs from
+  the last published value (the first reading after start/enable is the
+  baseline). Both are user-owned: the store preserves them across metadata
+  re-discovery (`USER_DATAPOINT_COLUMNS`). Defaults (null) keep the prior
+  full-snapshot behaviour.
 - **measurements.data** — `{datapoint_id: {name, units, value, ...extras}}`.
   Rows are **snapshots**: each row carries the asset's full current state
   (push protocols merge last-known values per window); changes-only rows are
-  an explicit protocol-level opt-in. Well-known optional extras: `status`,
+  an explicit opt-in, either protocol-level or per datapoint via
+  `change_detection`/`enabled` (then rows are partial — only the datapoints
+  that passed the gate). Well-known optional extras: `status`,
   `status_flags`, `source_tsp`, `description`. Soft limit ~500 datapoints
   per asset — beyond that, filter via datapoint_spec or split assets.
 - **assetstatus** — written by the core on transitions only:

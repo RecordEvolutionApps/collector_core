@@ -29,6 +29,10 @@ DEFAULT_BUFFER_SIZE = 10000
 # How often the background flusher retries draining the buffer (seconds).
 FLUSH_INTERVAL = 15
 
+# Sentinel for "no value seen yet" in the change-detection cache, so a genuine
+# None reading is distinguished from a datapoint that has never been published.
+_UNSET = object()
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -47,8 +51,15 @@ class Collector:
         self.ironflock = None
         self.store = None
         self.gateway = {}
+        # The live datapoints catalog (kept in sync by the table subscription
+        # and the store). Read per publish to gate writes by the user-set
+        # ``enabled`` / ``change_detection`` columns.
+        self.datapoints: list[dict] = []
         self.asset_tasks: dict[str, asyncio.Task] = {}
         self._asset_status: dict[str, str] = {}
+        # Last value published per (asset_name, datapoint_id) for change
+        # detection; only populated for change-detection datapoints.
+        self._last_values: dict[tuple, object] = {}
         # Bounded FIFO of (table, payload) writes that could not be sent while
         # the cloud link was down; drained in order on reconnect.
         self._buffer = deque(maxlen=DEFAULT_BUFFER_SIZE)
@@ -271,6 +282,7 @@ class Collector:
                     a for a in assets if a["asset_name"] != asset["asset_name"]
                 ]
                 self.stop_asset_task(asset["asset_name"])
+                self._clear_datapoint_values(asset["asset_name"])
                 try:
                     await self.clear_asset_status(asset)
                 except Exception as e:
@@ -299,14 +311,20 @@ class Collector:
                 ],
             },
         )
+        # Subscribe to, return and store the SAME list object so the live
+        # subscription, the store and the collector's gating all stay in sync
+        # (a fresh [] here would diverge from the subscribed list on empty
+        # startup, hiding later catalog/edit updates until a restart).
+        if not datapoints:
+            datapoints = []
         await self.ironflock.subscribe_to_table(
             "datapoints", self._handle_datapoint_update(datapoints)
         )
 
-        if not datapoints:
+        if datapoints:
+            print(f"Loaded {len(datapoints)} datapoint(s) from datapoints table")
+        else:
             print("No datapoints found in the datapoints table.")
-            return []
-        print(f"Loaded {len(datapoints)} datapoint(s) from datapoints table")
 
         return datapoints
 
@@ -411,6 +429,20 @@ class Collector:
 
         return provider
 
+    def _datapoint_catalog(self, asset_name):
+        """Map ``datapoint_id`` -> live catalog row for one asset, used to read
+        the per-datapoint ``enabled`` / ``change_detection`` settings."""
+        return {
+            row.get("datapoint_id"): row
+            for row in self.datapoints
+            if row.get("asset_name") == asset_name
+        }
+
+    def _clear_datapoint_values(self, asset_name):
+        """Drop the change-detection cache for a removed asset."""
+        for key in [k for k in self._last_values if k[0] == asset_name]:
+            del self._last_values[key]
+
     async def _publish_batch(self, asset, datapoints, raw):
         """Assemble and write one measurements row from a yielded batch.
 
@@ -418,11 +450,19 @@ class Collector:
         protocols can deliver partial batches without writing None entries
         for absent datapoints. An empty raw map writes nothing. Returns
         whether anything was published.
+
+        Each datapoint is gated by its catalog row: an explicit
+        ``enabled == False`` drops it (per-datapoint pause), and with
+        ``change_detection`` set it is written only when its value differs from
+        the last published value. With both off the full snapshot is written as
+        before; when gating empties the row, nothing is sent.
         """
+        asset_name = asset["asset_name"]
         by_id = {dp["id"]: dp for dp in datapoints if dp.get("id")}
+        catalog = self._datapoint_catalog(asset_name)
         payload = {
             "tsp": _now(),
-            "asset_name": asset["asset_name"],
+            "asset_name": asset_name,
             "gateway_id": self.device_key,
             "data": {},
         }
@@ -430,9 +470,17 @@ class Collector:
             datapoint = by_id.get(datapoint_id)
             if datapoint is None:
                 continue
-            payload["data"][datapoint_id] = self.adapter.make_entry(
-                asset, datapoint, raw_value
-            )
+            meta = catalog.get(datapoint_id)
+            if meta is not None and meta.get("enabled") is False:
+                continue  # datapoint paused
+            entry = self.adapter.make_entry(asset, datapoint, raw_value)
+            if meta is not None and bool(meta.get("change_detection")):
+                key = (asset_name, datapoint_id)
+                value = entry.get("value")
+                if self._last_values.get(key, _UNSET) == value:
+                    continue  # unchanged since last publish
+                self._last_values[key] = value
+            payload["data"][datapoint_id] = entry
 
         if not payload["data"]:
             return False
@@ -495,9 +543,9 @@ class Collector:
         except Exception as e:
             print(f"apply_settings failed, using adapter defaults: {e}")
 
-        datapoints = await self.load_datapoints()
+        self.datapoints = await self.load_datapoints()
         self.store = DatapointStore(
-            self.ironflock, self.device_key, datapoints, store_data=self.store_data
+            self.ironflock, self.device_key, self.datapoints, store_data=self.store_data
         )
         await self.load_asset_configs()
 

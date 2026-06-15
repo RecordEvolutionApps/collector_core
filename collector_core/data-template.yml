@@ -136,6 +136,14 @@ data:
           name: Path
           description: Hierarchical locator of the datapoint within the asset (protocol-defined, e.g. port3, slot2/subslot1, Objects/Boiler1, Axes/X). Empty for flat protocols.
           dataType: string
+        - id: enabled
+          name: Enabled
+          description: Per-datapoint pause/run switch. Only an explicit false drops the datapoint from every measurements row; missing/null means collected.
+          dataType: boolean
+        - id: change_detection
+          name: Change Detection
+          description: If true, the datapoint is written only when its value differs from the last written value (store-on-change). Missing/null/false stores every reading.
+          dataType: boolean
         - id: deleted
           name: Deleted Flag
           description: Deleted Flag

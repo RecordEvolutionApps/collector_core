@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ironflock-collector-core"
-version = "2.2.0"
+version = "2.2.1"
 description = "Protocol-agnostic collector core for IronFlock data collector apps"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,8 +14,15 @@ authors = [{ name = "Record Evolution GmbH" }]
 # (the handle is injected by the app's main.py).
 dependencies = []
 
+[project.optional-dependencies]
+# Local dev/test only — the published core keeps zero runtime dependencies.
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
 [tool.setuptools]
 packages = ["collector_core"]
 
 [tool.setuptools.package-data]
 collector_core = ["data-template.yml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

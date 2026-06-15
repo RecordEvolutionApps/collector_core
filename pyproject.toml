@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ironflock-collector-core"
-version = "2.2.1"
+version = "2.2.2"
 description = "Protocol-agnostic collector core for IronFlock data collector apps"
 readme = "README.md"
 requires-python = ">=3.10"

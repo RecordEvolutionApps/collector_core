@@ -20,7 +20,12 @@ from collections import deque
 from contextlib import aclosing
 from datetime import datetime, timezone
 
-from collector_core.adapter import PLATFORM_COLUMNS, DatapointStore, DatapointsChanged
+from collector_core.adapter import (
+    PLATFORM_COLUMNS,
+    DatapointStore,
+    DatapointsChanged,
+    emit_error,
+)
 
 # Max data rows buffered locally while the cloud link is down, when the
 # gateway row sets no buffer_size. Oldest rows are dropped on overflow.
@@ -73,6 +78,20 @@ class Collector:
         """Provide the IronFlock handle used for all table I/O. Must be called
         before ``run`` (which IronFlock invokes as its ``mainFunc``)."""
         self.ironflock = ironflock
+
+    async def report_error(self, message, level="error", asset_name=None, user_message=None):
+        """Surface an operational error to the platform ``error-logs`` table so
+        it pops up on the board's toast widget. Best-effort (never raises).
+
+        ``message`` is the technical text written to ``msg`` (the asset name is
+        prefixed into it, since the table has no asset column). ``user_message``
+        is the operator-facing line the toast shows — pass a friendly,
+        self-contained sentence (already naming the asset); when None the toast
+        falls back to the technical message. ``level`` follows the SDK convention
+        (``error``/``warn``/``info``/``debug``); failures that stop data flowing
+        use ``error`` (shown red by the toast)."""
+        text = f"{asset_name}: {message}" if asset_name else message
+        await emit_error(self.ironflock, text, level, user_message=user_message)
 
     # ----------------------------------------------------------------- gateway
 
@@ -142,6 +161,11 @@ class Collector:
                 await self.adapter.apply_settings(row)
             except Exception as e:
                 print(f"apply_settings failed: {e}")
+                await self.report_error(
+                    f"settings could not be applied: {e}",
+                    level="warn",
+                    user_message="Gateway settings could not be applied; using defaults.",
+                )
 
         return handler
 
@@ -151,10 +175,13 @@ class Collector:
         """Record an asset state transition (online | offline | paused).
 
         Appends to ``assetstatus`` only when the status actually changes, so
-        the table is a transition log (latest row = current state)."""
+        the table is a transition log (latest row = current state). Returns
+        ``True`` when the status changed (a row was written), ``False`` when it
+        was already in this state — callers gate transition-only side effects
+        (e.g. reporting an error toast on the first offline) on this."""
         asset_name = asset["asset_name"]
         if self._asset_status.get(asset_name) == status:
-            return
+            return False
         self._asset_status[asset_name] = status
         row = {
             "tsp": _now(),
@@ -166,6 +193,7 @@ class Collector:
         }
         print("asset status:", row)
         await self._send("assetstatus", row)
+        return True
 
     async def clear_asset_status(self, asset):
         """Soft-delete the status stream of a removed asset."""
@@ -268,6 +296,12 @@ class Collector:
                 await self.configure_asset(asset, configured_assets)
             except Exception as e:
                 print(f"Error configuring asset {asset_name}, skipping: {e}")
+                await self.report_error(
+                    f"could not be configured: {e}",
+                    level="error",
+                    asset_name=asset_name,
+                    user_message=f"'{asset_name}' has an invalid configuration.",
+                )
 
         await self.ironflock.subscribe_to_table(
             "assets", self._handle_asset_update(configured_assets)
@@ -295,10 +329,15 @@ class Collector:
                 try:
                     await self.configure_asset(asset, assets)
                 except Exception as e:
-                    print(
-                        f"Error configuring asset {asset.get('asset_name', 'unknown')}: {e}"
-                    )
+                    asset_name = asset.get("asset_name", "unknown")
+                    print(f"Error configuring asset {asset_name}: {e}")
                     traceback.print_exc()
+                    await self.report_error(
+                        f"could not be configured: {e}",
+                        level="error",
+                        asset_name=asset_name,
+                        user_message=f"'{asset_name}' has an invalid configuration.",
+                    )
 
         return handler
 
@@ -549,7 +588,17 @@ class Collector:
             except Exception as e:
                 print(f"collect_asset {asset_name} error: {e}")
                 try:
-                    await self.set_asset_status(asset, "offline", str(e))
+                    # Report to the board's toast only on the actual transition
+                    # to offline, not on every retry cycle, so a persistently
+                    # failing asset pops one toast (and one again after a
+                    # recovery + new failure), never a stream of them.
+                    if await self.set_asset_status(asset, "offline", str(e)):
+                        await self.report_error(
+                            str(e),
+                            level="error",
+                            asset_name=asset_name,
+                            user_message=f"{asset_name} is not responding",
+                        )
                 except Exception as status_error:
                     print(f"Failed to record offline status: {status_error}")
             finally:
@@ -564,6 +613,11 @@ class Collector:
             await self.adapter.apply_settings(self.gateway)
         except Exception as e:
             print(f"apply_settings failed, using adapter defaults: {e}")
+            await self.report_error(
+                f"settings could not be applied: {e}",
+                level="warn",
+                user_message="Gateway settings could not be applied; using defaults.",
+            )
 
         self.datapoints = await self.load_datapoints()
         self.store = DatapointStore(

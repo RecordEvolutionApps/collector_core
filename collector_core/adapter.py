@@ -40,6 +40,26 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+async def emit_error(ironflock, message, level="error", user_message=None):
+    """Best-effort write to the platform ``error-logs`` table, surfaced live on
+    the board by the toast widget.
+
+    Never raises: error reporting is a UX nicety and a failure here (missing
+    handle, SDK without ``report_error``, link down) must never break
+    collection. ``message`` is the technical text (stringified — pass a concise
+    string rather than an exception object, since ``report_error`` records an
+    exception's full traceback). ``user_message`` is the operator-facing display
+    line the toast shows; when None the SDK defaults it to ``message``. ``level``
+    is one of ``error``/``warn``/``info``/``debug``.
+    """
+    if ironflock is None:
+        return
+    try:
+        await ironflock.report_error(str(message), level=level, user_message=user_message)
+    except Exception as e:
+        print(f"report_error failed: {e}")
+
+
 class DatapointsChanged(Exception):
     """Raised by a session (from ``read_values`` or a ``stream`` override)
     when the set of available datapoints has changed at the source (IO-Link
@@ -82,6 +102,15 @@ class DatapointStore:
     @property
     def device_key(self):
         return self._device_key
+
+    async def report_error(self, message, level="error", user_message=None):
+        """Surface an error to the board's toast widget (best-effort).
+
+        Lets an adapter report a swallowed, user-facing problem (e.g. a bad
+        uploaded device description) from ``prepare_datapoints``, where it holds
+        the store but not the collector. ``message`` is the technical text;
+        ``user_message`` is the friendly line shown on the toast. Never raises."""
+        await emit_error(self._ironflock, message, level, user_message)
 
     def rows_for_asset(self, asset_name):
         """Return the in-memory datapoint rows belonging to an asset."""

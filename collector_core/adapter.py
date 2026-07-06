@@ -249,10 +249,17 @@ class ProtocolSession(ABC):
 
         Returns ``{datapoint_id: raw_value}`` with a key for every readable
         datapoint. Encapsulates connect/reconnect; raises on failure (the
-        core handles backoff/reconnect and the offline status). May raise
-        ``DatapointsChanged``. Required only when the default ``stream`` is
-        used; push protocols that override ``stream`` need not implement it.
-        Not called in demo mode.
+        core handles backoff/reconnect and the offline status).
+
+        Raise a ``CollectorError`` subclass from ``collector_core.errors`` with a
+        ``user_message`` so the board's toast shows a meaningful line: a
+        ``DeviceConnectionError`` when the device can't be reached, a
+        ``DeviceReadError`` when a connection was made but the response was
+        bad/undecodable. May also raise ``DatapointsChanged``. Any other
+        exception is still reported (with a generic fallback message).
+
+        Required only when the default ``stream`` is used; push protocols that
+        override ``stream`` need not implement it. Not called in demo mode.
         """
         raise NotImplementedError(
             f"{type(self).__name__} must implement read_values() or override stream()"
@@ -288,6 +295,12 @@ class ProtocolAdapter(ABC):
         (plus any protocol-private keys the session needs). May discover and
         persist metadata via ``store`` (MTConnect probe, BACnet object-list)
         or just parse the user-authored ``datapoint_spec`` (Modbus).
+
+        Raise a ``CollectorError`` subclass from ``collector_core.errors`` with a
+        ``user_message`` on failure: ``ConfigurationError`` for an invalid spec /
+        unknown profile / missing field, ``DeviceConnectionError`` when discovery
+        can't reach the device. The core reports it (as an asset-config or offline
+        error) and skips/retries the asset.
         """
 
     @abstractmethod

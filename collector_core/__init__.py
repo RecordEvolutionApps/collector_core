@@ -11,6 +11,13 @@ from collector_core.adapter import (
     ProtocolSession,
 )
 from collector_core.collector import Collector
+from collector_core.errors import (
+    CollectorError,
+    ConfigurationError,
+    DeviceConnectionError,
+    DeviceReadError,
+    SettingsError,
+)
 
 __all__ = [
     "Collector",
@@ -19,4 +26,10 @@ __all__ = [
     "DatapointStore",
     "DatapointsChanged",
     "PLATFORM_COLUMNS",
+    # Error hierarchy — adapters raise these; the core reports them.
+    "CollectorError",
+    "ConfigurationError",
+    "DeviceConnectionError",
+    "DeviceReadError",
+    "SettingsError",
 ]

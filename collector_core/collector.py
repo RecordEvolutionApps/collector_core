@@ -26,6 +26,7 @@ from collector_core.adapter import (
     DatapointsChanged,
     emit_error,
 )
+from collector_core.errors import CollectorError
 
 # Max data rows buffered locally while the cloud link is down, when the
 # gateway row sets no buffer_size. Oldest rows are dropped on overflow.
@@ -48,10 +49,15 @@ def _now():
 
 
 class Collector:
-    def __init__(self, device_name, device_key, adapter, store_data=True):
+    def __init__(self, device_name, device_key, adapter, store_data=True, on_error=None):
         self.device_name = device_name
         self.device_key = device_key
         self.adapter = adapter
+        # Optional reporting hook so an implementation can own the report_error
+        # call. Signature: on_error(message, *, level, user_message, asset_name);
+        # may be sync or async. When None (default) the core reports directly to
+        # the platform error-logs table via the injected SDK handle.
+        self.on_error = on_error
         # Default when the gateway row has no store_data column. With
         # store_data False, configuration is still read live from the
         # platform but collected data is not written to it.
@@ -80,18 +86,51 @@ class Collector:
         self.ironflock = ironflock
 
     async def report_error(self, message, level="error", asset_name=None, user_message=None):
-        """Surface an operational error to the platform ``error-logs`` table so
-        it pops up on the board's toast widget. Best-effort (never raises).
+        """Surface an operational error to the operator. Best-effort (never raises).
 
-        ``message`` is the technical text written to ``msg`` (the asset name is
-        prefixed into it, since the table has no asset column). ``user_message``
-        is the operator-facing line the toast shows — pass a friendly,
-        self-contained sentence (already naming the asset); when None the toast
-        falls back to the technical message. ``level`` follows the SDK convention
-        (``error``/``warn``/``info``/``debug``); failures that stop data flowing
-        use ``error`` (shown red by the toast)."""
+        ``message`` is the technical text written to the error-logs ``msg`` column
+        (the asset name is prefixed in, since the table has no asset column).
+        ``user_message`` is the operator-facing line the board's toast shows — a
+        friendly, self-contained sentence (already naming the asset); when None the
+        toast falls back to the technical message. ``level`` follows the SDK
+        convention (``error``/``warn``/``info``/``debug``); failures that stop data
+        flowing use ``error`` (shown red by the toast).
+
+        If an ``on_error`` hook was provided the implementation owns reporting: the
+        hook is called with the resolved ``(message, level, user_message,
+        asset_name)`` (awaited if it returns a coroutine). Otherwise the core writes
+        to the platform error-logs table directly via the injected SDK handle."""
         text = f"{asset_name}: {message}" if asset_name else message
+        if self.on_error is not None:
+            try:
+                result = self.on_error(
+                    text, level=level, user_message=user_message, asset_name=asset_name
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                print(f"on_error hook failed: {e}")
+            return
         await emit_error(self.ironflock, text, level, user_message=user_message)
+
+    async def report_exception(
+        self, exc, *, level="error", asset_name=None, fallback_user_message=None
+    ):
+        """Report a caught exception through :meth:`report_error`.
+
+        The technical text is ``str(exc)``. The toast's display line is the
+        exception's ``user_message`` when it is a ``CollectorError`` (so adapters
+        control the wording via the error they raise), otherwise
+        ``fallback_user_message``. This is the single funnel the core's boundary
+        handlers use, so typed adapter errors get meaningful toasts and any
+        unexpected error still gets reported."""
+        user_message = exc.user_message if isinstance(exc, CollectorError) else None
+        await self.report_error(
+            str(exc),
+            level=level,
+            asset_name=asset_name,
+            user_message=user_message or fallback_user_message,
+        )
 
     # ----------------------------------------------------------------- gateway
 
@@ -161,10 +200,10 @@ class Collector:
                 await self.adapter.apply_settings(row)
             except Exception as e:
                 print(f"apply_settings failed: {e}")
-                await self.report_error(
-                    f"settings could not be applied: {e}",
+                await self.report_exception(
+                    e,
                     level="warn",
-                    user_message="Gateway settings could not be applied; using defaults.",
+                    fallback_user_message="Gateway settings could not be applied; using defaults.",
                 )
 
         return handler
@@ -296,11 +335,10 @@ class Collector:
                 await self.configure_asset(asset, configured_assets)
             except Exception as e:
                 print(f"Error configuring asset {asset_name}, skipping: {e}")
-                await self.report_error(
-                    f"could not be configured: {e}",
-                    level="error",
+                await self.report_exception(
+                    e,
                     asset_name=asset_name,
-                    user_message=f"'{asset_name}' has an invalid configuration.",
+                    fallback_user_message=f"'{asset_name}' has an invalid configuration.",
                 )
 
         await self.ironflock.subscribe_to_table(
@@ -332,11 +370,10 @@ class Collector:
                     asset_name = asset.get("asset_name", "unknown")
                     print(f"Error configuring asset {asset_name}: {e}")
                     traceback.print_exc()
-                    await self.report_error(
-                        f"could not be configured: {e}",
-                        level="error",
+                    await self.report_exception(
+                        e,
                         asset_name=asset_name,
-                        user_message=f"'{asset_name}' has an invalid configuration.",
+                        fallback_user_message=f"'{asset_name}' has an invalid configuration.",
                     )
 
         return handler
@@ -593,11 +630,10 @@ class Collector:
                     # failing asset pops one toast (and one again after a
                     # recovery + new failure), never a stream of them.
                     if await self.set_asset_status(asset, "offline", str(e)):
-                        await self.report_error(
-                            str(e),
-                            level="error",
+                        await self.report_exception(
+                            e,
                             asset_name=asset_name,
-                            user_message=f"{asset_name} is not responding",
+                            fallback_user_message=f"{asset_name} is not responding",
                         )
                 except Exception as status_error:
                     print(f"Failed to record offline status: {status_error}")
@@ -608,34 +644,53 @@ class Collector:
     # ------------------------------------------------------------------- run
 
     async def run(self):
-        await self.load_gateway()
         try:
-            await self.adapter.apply_settings(self.gateway)
-        except Exception as e:
-            print(f"apply_settings failed, using adapter defaults: {e}")
-            await self.report_error(
-                f"settings could not be applied: {e}",
-                level="warn",
-                user_message="Gateway settings could not be applied; using defaults.",
+            await self.load_gateway()
+            try:
+                await self.adapter.apply_settings(self.gateway)
+            except Exception as e:
+                print(f"apply_settings failed, using adapter defaults: {e}")
+                await self.report_exception(
+                    e,
+                    level="warn",
+                    fallback_user_message="Gateway settings could not be applied; using defaults.",
+                )
+
+            self.datapoints = await self.load_datapoints()
+            self.store = DatapointStore(
+                self.ironflock, self.device_key, self.datapoints, store_data=self.store_data
             )
+            await self.load_asset_configs()
 
-        self.datapoints = await self.load_datapoints()
-        self.store = DatapointStore(
-            self.ironflock, self.device_key, self.datapoints, store_data=self.store_data
-        )
-        await self.load_asset_configs()
+            # Drains the offline buffer on reconnect even when no new data flows.
+            asyncio.create_task(self._flush_loop())
 
-        # Drains the offline buffer on reconnect even when no new data flows.
-        asyncio.create_task(self._flush_loop())
+            # Table subscriptions are active now, so asset rows appended by
+            # protocol background work (e.g. network discovery) are picked up.
+            # A discovery failure must not abort startup — report and continue.
+            try:
+                await self.adapter.start_background(self)
+            except Exception as e:
+                print(f"start_background failed: {e}")
+                await self.report_exception(
+                    e,
+                    fallback_user_message="Background device discovery failed to start.",
+                )
 
-        # Table subscriptions are active now, so asset rows appended by
-        # protocol background work (e.g. network discovery) are picked up.
-        await self.adapter.start_background(self)
-
-        await self.ironflock.subscribe_to_table(
-            "gateways", self._handle_gateway_update()
-        )
-        await self.register_gateway()
+            await self.ironflock.subscribe_to_table(
+                "gateways", self._handle_gateway_update()
+            )
+            await self.register_gateway()
+        except Exception as e:
+            # Fatal startup failure (config load, subscription, registration):
+            # surface it to the operator, then re-raise so the runtime sees the
+            # collector could not start.
+            print(f"collector startup failed: {e}")
+            traceback.print_exc()
+            await self.report_exception(
+                e, fallback_user_message="The collector failed to start."
+            )
+            raise
 
         while True:
             await asyncio.sleep(3600)

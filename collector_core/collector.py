@@ -79,6 +79,12 @@ class Collector:
         # the cloud link was down; drained in order on reconnect.
         self._buffer = deque(maxlen=DEFAULT_BUFFER_SIZE)
         self._flush_lock = asyncio.Lock()
+        # Cloud-link outage bookkeeping, used to inform the operator once on
+        # recovery (never during the outage, when reporting can't get through):
+        # whether the last flush attempt failed, and how many buffered rows the
+        # bounded buffer dropped (oldest-first) while the link was down.
+        self._link_down = False
+        self._dropped_rows = 0
 
     def set_ironflock(self, ironflock):
         """Provide the IronFlock handle used for all table I/O. Must be called
@@ -311,6 +317,11 @@ class Collector:
             print(
                 "No assets found in the assets table. Please add asset configurations first."
             )
+            await self.report_error(
+                "no assets found in the assets table",
+                level="info",
+                user_message="No assets configured yet — add an asset configuration to start collecting.",
+            )
         print(f"Loaded {len(result)} asset(s) from assets table")
 
         configured_assets = []
@@ -322,6 +333,16 @@ class Collector:
             if not asset_name or gateway_id is None:
                 try:
                     await self.soft_delete_asset(asset)
+                    await self.report_error(
+                        f"removed invalid asset config (asset_name={asset_name!r}, "
+                        f"gateway_id={gateway_id!r})",
+                        level="warn",
+                        user_message=(
+                            f"An incomplete asset configuration"
+                            f"{f' ({asset_name!r})' if asset_name else ''} was removed — "
+                            "it was missing a name or gateway assignment."
+                        ),
+                    )
                 except Exception as e:
                     print(f"Failed to soft-delete invalid asset: {e}")
                 continue
@@ -455,6 +476,8 @@ class Collector:
         """
         if not self.store_data:
             return
+        if self._buffer.maxlen is not None and len(self._buffer) >= self._buffer.maxlen:
+            self._dropped_rows += 1  # deque drops the oldest row silently
         self._buffer.append((table, payload))
         await self._flush()
 
@@ -491,9 +514,33 @@ class Collector:
                 except Exception as e:
                     # Still down: re-queue everything not yet sent, in order.
                     self._buffer.extendleft(reversed(pending[i:]))
+                    self._link_down = True
                     print(f"buffered {len(self._buffer)} row(s); link down: {e}")
                     return
                 i = j
+
+            # Backlog fully drained after an outage: tell the operator once,
+            # escalating to a warning when the bounded buffer overflowed and
+            # readings were lost.
+            if n and self._link_down:
+                self._link_down = False
+                dropped, self._dropped_rows = self._dropped_rows, 0
+                if dropped:
+                    await self.report_error(
+                        f"link restored; delivered {n} buffered row(s), "
+                        f"{dropped} oldest row(s) dropped on buffer overflow",
+                        level="warn",
+                        user_message=(
+                            f"Connection restored — {n} buffered readings were "
+                            f"delivered, but {dropped} were lost while offline."
+                        ),
+                    )
+                else:
+                    await self.report_error(
+                        f"link restored; delivered {n} buffered row(s)",
+                        level="info",
+                        user_message="Connection restored — all buffered readings were delivered.",
+                    )
 
     async def _flush_loop(self):
         """Periodically retry draining the buffer, so a backlog is sent on
@@ -586,6 +633,21 @@ class Collector:
         await self._send("measurements", payload)
         return True
 
+    async def _mark_online(self, asset):
+        """Record the online status; on a recovery (offline -> online) also
+        inform the operator, mirroring the one-toast-per-transition rule the
+        offline path follows. First-ever online stays quiet — a toast per
+        asset at every startup would be noise, not signal."""
+        asset_name = asset["asset_name"]
+        was_offline = self._asset_status.get(asset_name) == "offline"
+        if await self.set_asset_status(asset, "online") and was_offline:
+            await self.report_error(
+                "recovered; data is flowing again",
+                level="info",
+                asset_name=asset_name,
+                user_message=f"'{asset_name}' is back online.",
+            )
+
     async def collect_asset(self, asset):
         """Session-lifecycle loop for one asset: create a session, consume its
         stream (or pace demo values), and on any failure close it, mark the
@@ -607,14 +669,14 @@ class Collector:
                         if await self._publish_batch(
                             asset, datapoints, session.demo_values(datapoints)
                         ):
-                            await self.set_asset_status(asset, "online")
+                            await self._mark_online(asset)
                         await asyncio.sleep(interval)
                 else:
                     stream = session.stream(provider, interval)
                     async with aclosing(stream):
                         async for datapoints, raw in stream:
                             if await self._publish_batch(asset, datapoints, raw):
-                                await self.set_asset_status(asset, "online")
+                                await self._mark_online(asset)
                     print(f"collect_asset {asset_name}: stream ended, restarting")
             except asyncio.CancelledError:
                 raise

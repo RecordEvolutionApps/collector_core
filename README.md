@@ -64,7 +64,10 @@ The core declares **zero dependencies** — the `ironflock` SDK handle is inject
 by the app — but it does call methods on that handle. If a release starts using
 a newer SDK method, record the new minimum here and in the release notes so apps
 bump their own `ironflock` pin. **Current minimum: `ironflock >= 1.4.1`** (the
-buffer flush uses `append_rows_to_table`).
+buffer flush uses `append_rows_to_table`). Apps that pass `ports=` to publish
+remote-access URLs (`gateways.url`) additionally need **`ironflock >= 1.5.3`**
+for `getRemoteAccessUrlForPort`'s `protocol` / `remote_port_environment`
+arguments; apps that declare no ports stay on the 1.4.1 floor.
 
 ### Steps
 

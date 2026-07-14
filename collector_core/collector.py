@@ -49,7 +49,9 @@ def _now():
 
 
 class Collector:
-    def __init__(self, device_name, device_key, adapter, store_data=True, on_error=None):
+    def __init__(
+        self, device_name, device_key, adapter, store_data=True, on_error=None, ports=None
+    ):
         self.device_name = device_name
         self.device_key = device_key
         self.adapter = adapter
@@ -58,6 +60,15 @@ class Collector:
         # may be sync or async. When None (default) the core reports directly to
         # the platform error-logs table via the injected SDK handle.
         self.on_error = on_error
+        # The app's declared remote-access ports — the `ports:` list of its
+        # .ironflock/port-template.yml (or any subset), each a dict with
+        # ``port`` plus optional ``name``/``protocol``/``main``/
+        # ``remote_port_environment``. Resolved to public tunnel URLs via the
+        # SDK and written to the gateway row's ``url`` column at registration so
+        # boards can list/embed a gateway's web UIs (iframe src). Empty (the
+        # default) leaves the ``url`` column untouched. Use
+        # ``Collector.load_ports_from_template()`` to read them from the template.
+        self.ports = list(ports) if ports else []
         # Default when the gateway row has no store_data column. With
         # store_data False, configuration is still read live from the
         # platform but collected data is not written to it.
@@ -178,10 +189,88 @@ class Collector:
         self._apply_gateway_row(self.gateway)
         print(f"Gateway settings: {self.gateway}")
 
+    @staticmethod
+    def load_ports_from_template(path=".ironflock/port-template.yml"):
+        """Read the app's port template and return its ``ports:`` list, ready to
+        pass as the ``ports`` argument.
+
+        Optional convenience so an app need not re-implement the parse; the core
+        keeps zero hard dependencies by importing PyYAML lazily here (only apps
+        that call this helper need it). Returns ``[]`` when the file is absent
+        (dev/demo) so callers can pass the result unconditionally, e.g.::
+
+            Collector(..., ports=Collector.load_ports_from_template())
+        """
+        import os
+
+        if not os.path.exists(path):
+            print(f"port template not found at {path}; no remote-access URLs will be published")
+            return []
+        try:
+            import yaml
+        except ImportError:
+            print(
+                "load_ports_from_template needs PyYAML; install it or pass ports= "
+                "explicitly. No remote-access URLs will be published."
+            )
+            return []
+        with open(path) as f:
+            doc = yaml.safe_load(f) or {}
+        ports = doc.get("ports")
+        return ports if isinstance(ports, list) else []
+
+    def _resolve_remote_access_urls(self):
+        """Resolve each declared port to its public tunnel URL via the injected SDK.
+
+        Returns a list of ``{name, port, protocol, main, url}`` — one entry per
+        configured port, in template order — for the gateway row's ``url``
+        column. ``url`` is the absolute tunnel URL the SDK composes for that port
+        (ready to use as an iframe ``src``), or ``None`` when the tunnel/identity
+        is not (yet) available (e.g. a tcp/udp port before its tunnel is up).
+
+        Best-effort: a port with no numeric ``port`` is skipped, and any SDK
+        failure (missing method on an older SDK, resolution error) leaves that
+        entry's ``url`` as ``None`` rather than aborting gateway registration.
+        Requires ``ironflock >= 1.5.3`` for the ``protocol`` /
+        ``remote_port_environment`` arguments; on older SDKs every ``url`` is
+        ``None``.
+        """
+        resolver = getattr(self.ironflock, "getRemoteAccessUrlForPort", None)
+        urls = []
+        for spec in self.ports:
+            try:
+                port = int(spec["port"])
+            except (KeyError, TypeError, ValueError):
+                print(f"skipping remote-access port without a valid port: {spec!r}")
+                continue
+            protocol = str(spec.get("protocol") or "http").lower()
+            remote_port_environment = spec.get("remote_port_environment")
+            url = None
+            if resolver is not None:
+                try:
+                    url = resolver(
+                        port,
+                        protocol=protocol,
+                        remote_port_environment=remote_port_environment,
+                    )
+                except Exception as e:
+                    print(f"could not resolve remote-access URL for port {port}: {e}")
+            urls.append(
+                {
+                    "name": spec.get("name") or str(port),
+                    "port": port,
+                    "protocol": protocol,
+                    "main": bool(spec.get("main")),
+                    "url": url,
+                }
+            )
+        return urls
+
     async def register_gateway(self):
         """Write the registry row, echoing existing columns so user-edited
         gateway settings survive the startup append (the appended row becomes
-        the latest one)."""
+        the latest one). When the app declared remote-access ports, their
+        resolved tunnel URLs are (re)written to the ``url`` column."""
         payload = {
             k: v for k, v in self.gateway.items() if k not in PLATFORM_COLUMNS
         }
@@ -191,6 +280,10 @@ class Collector:
             "app_started": _now(),
             "python": sys.version.split()[0],
         }
+        # Derived, core-owned: recompute from the live tunnel/identity rather than
+        # echoing a stale value forward.
+        if self.ports:
+            payload["url"] = self._resolve_remote_access_urls()
         payload["tsp"] = _now()
         await self.ironflock.append_to_table("gateways", payload)
 

@@ -30,7 +30,7 @@ the core columns and may extend them with protocol-specific columns.
 
 | Table | Purpose | Identity (latest-flag) | Core columns |
 |---|---|---|---|
-| `gateways` | registry + per-gateway settings | gateway_name | tsp, gateway_name, deleted, store_data, info (json) |
+| `gateways` | registry + per-gateway settings | gateway_name | tsp, gateway_name, deleted, store_data, info (json), url (json) |
 | `assets` | connected protocol endpoints | gateway_id, asset_name | tsp, asset_name, gateway_id, datapoint_spec, collect_interval, enabled, demo_mode, deleted |
 | `datapoints` | value-stream catalog per asset | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, enabled, change_detection, deleted |
 | `measurements` | timeseries recordings | — (append-only) | tsp, asset_name, gateway_id, data (json) |
@@ -75,6 +75,13 @@ Key semantics:
   remain active.
 - **gateways rows are echo-merged**: the core re-appends the existing row's
   columns at startup so user-edited settings survive the registry write.
+- **gateways.url** — remote-access URLs for the gateway, written by the core at
+  registration when the app declares ports (see below). A JSON list of
+  `{name, port, protocol, main, url}`, one entry per declared port, where `url`
+  is the ready-to-use absolute tunnel URL (directly embeddable as an iframe
+  `src`) or null while the tunnel/identity is unavailable. Derived and
+  core-owned: recomputed from the live tunnel/identity each startup rather than
+  echo-merged. Absent when the app declares no ports.
 - **Secrets never go into tables** (boards can read them). Credentials and
   certificates come from device environment or mounted volumes; tables hold
   only non-secret configuration.
@@ -152,3 +159,30 @@ ironflock = IronFlock(mainFunc=collector.run)
 collector.set_ironflock(ironflock)
 ironflock.run()
 ```
+
+## Remote-access URLs (gateways.url)
+
+To surface a gateway's own web UIs (a config UI, a live viewer) for embedding
+on a board, the app passes the ports it declares in its
+`.ironflock/port-template.yml` to the collector, which resolves each to a public
+tunnel URL via the SDK's `getRemoteAccessUrlForPort` and writes them to the
+gateway row's `url` column at registration:
+
+```python
+collector = Collector(
+    device_name=DEVICE_NAME,
+    device_key=DEVICE_KEY,
+    adapter=MyAdapter(),
+    ports=Collector.load_ports_from_template(),  # reads .ironflock/port-template.yml
+)
+```
+
+`ports` is a list of port specs — `{name, port, protocol?, main?,
+remote_port_environment?}`, the same shape as the template's `ports:` entries;
+pass a literal list instead of the helper if the app prefers not to depend on
+PyYAML. Each resolved entry is `{name, port, protocol, main, url}`; `url` is a
+ready-to-use absolute URL (iframe `src`) for `http`/`https` ports, or null for a
+`tcp`/`udp` port whose tunnel is not yet up. Resolution is best-effort and never
+blocks registration. Using this feature requires **`ironflock >= 1.5.3`** (the
+`protocol` / `remote_port_environment` arguments); apps that declare no ports
+are unaffected and keep the old minimum.

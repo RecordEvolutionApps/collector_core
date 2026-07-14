@@ -51,6 +51,15 @@ data:
           name: Info
           description: Additional gateway information (JSON), e.g. runtime details written by the app. Open for future extension.
           dataType: json
+        - id: url
+          name: Remote Access URLs
+          description: >-
+            Resolved remote-access URLs for this gateway's declared ports (JSON), written by the core at
+            registration. A list of {name, port, protocol, main, url}, one entry per port in the app's
+            port template, where url is the ready-to-use absolute tunnel URL from the ironflock SDK's
+            getRemoteAccessUrlForPort (directly embeddable as an iframe src) or null when the tunnel/identity
+            is not yet available. Empty/absent when the app declares no remote-access ports.
+          dataType: json
 
     # The connected protocol endpoints (machines, controllers, servers,
     # masters) reachable from a gateway. One row per asset; identity is

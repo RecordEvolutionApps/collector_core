@@ -145,10 +145,11 @@ class Collector:
         # The app's declared remote-access ports — the `ports:` list of its
         # .ironflock/port-template.yml (or any subset), each a dict with
         # ``port`` plus optional ``name``/``protocol``/``main``/
-        # ``remote_port_environment``. Resolved to public tunnel URLs via the
-        # SDK and written to the gateway row's ``url`` column at registration so
-        # boards can list/embed a gateway's web UIs (iframe src). Empty (the
-        # default) leaves the ``url`` column untouched. Use
+        # ``remote_port_environment``. Resolved to per-scope access URLs
+        # (local / appliance / cloud) and written to the gateway row's ``url``
+        # column at registration so boards can list/embed a gateway's web UIs
+        # (iframe src) — consumers pick a scope explicitly. Empty (the default)
+        # leaves the ``url`` column untouched. Use
         # ``Collector.load_ports_from_template()`` to read them from the template.
         self.ports = list(ports) if ports else []
         # App-provided extra gateway columns, merged into every gateway
@@ -306,20 +307,17 @@ class Collector:
         return ports if isinstance(ports, list) else []
 
     def _resolve_remote_access_urls(self):
-        """Resolve each declared port to its public tunnel URL via the injected SDK.
+        """Resolve each declared port's access URLs for the gateway ``url`` column.
 
         Returns a dict **keyed by the port number** (as a string) mapping to
-        ``{name, protocol, main, url, local?, appliance?, cloud?}`` — one entry
-        per configured port — for the gateway row's ``url`` column, so the
-        frontend can look a port up directly (``url["55000"]``) instead of
-        scanning a list. ``url`` is the absolute tunnel URL the SDK composes
-        for that port (ready to use as an iframe ``src``), or ``None`` when
-        the tunnel/identity is not (yet) available (e.g. a tcp/udp port before
-        its tunnel is up) — kept for backward compatibility; it equals the
-        preferred (cloud) route.
+        ``{name, protocol, main, local?, appliance?, cloud?}`` — one entry per
+        configured port — so the frontend can look a port up directly
+        (``url["55000"]``) instead of scanning a list.
 
-        The three access scopes are separate keys, each ``{... , url}`` with a
-        directly usable URL (iframe ``src`` for http/https ports):
+        There is deliberately NO ambient/default URL field: a consumer must
+        choose the access scope explicitly. The three scopes are separate
+        keys, each ``{... , url}`` with a directly usable URL (iframe ``src``
+        for http/https ports):
 
         - ``local: {ip, port, url}`` — the LAN endpoint other devices on the
           same network reach directly (no tunnel). Present when the platform
@@ -332,15 +330,15 @@ class Collector:
           ``i{INSTANCE_KEY}-…`` URL on instance devices, the plain tunnel URL
           on cloud-managed devices. Reachable once the port's tunnel is active.
 
-        Best-effort: a port with no numeric ``port`` is skipped, and any SDK
-        failure (missing method on an older SDK, resolution error) leaves that
-        entry's ``url`` as ``None`` rather than aborting gateway registration.
-        Absent identity/env leaves the corresponding scope key out entirely.
-        If two specs declare the same port the last one wins. Requires
-        ``ironflock >= 1.5.3`` for the ``protocol`` / ``remote_port_environment``
-        arguments; on older SDKs every ``url`` is ``None``.
+        Best-effort: a port with no numeric ``port`` is skipped, and absent
+        identity/env leaves the corresponding scope key out entirely (an entry
+        can carry no scope at all, e.g. in local dev). If two specs declare
+        the same port the last one wins.
+
+        Breaking change in 2.7.0: the legacy top-level ``url`` field (the
+        SDK-preferred route) is gone — bindings like ``url.55000.url`` must
+        become ``url.55000.cloud.url`` (or ``.appliance.url`` / ``.local.url``).
         """
-        resolver = getattr(self.ironflock, "getRemoteAccessUrlForPort", None)
         urls = {}
         for spec in self.ports:
             try:
@@ -350,21 +348,10 @@ class Collector:
                 continue
             protocol = str(spec.get("protocol") or "http").lower()
             remote_port_environment = spec.get("remote_port_environment")
-            url = None
-            if resolver is not None:
-                try:
-                    url = resolver(
-                        port,
-                        protocol=protocol,
-                        remote_port_environment=remote_port_environment,
-                    )
-                except Exception as e:
-                    print(f"could not resolve remote-access URL for port {port}: {e}")
             entry = {
                 "name": spec.get("name") or str(port),
                 "protocol": protocol,
                 "main": bool(spec.get("main")),
-                "url": url,
             }
             lan_ip = os.environ.get("DEVICE_LAN_IP")
             mapped = os.environ.get(f"DEVICE_PORT_FOR_{port}")
@@ -392,9 +379,9 @@ class Collector:
         """Write the registry row, echoing existing columns so user-edited
         gateway settings survive the startup append (the appended row becomes
         the latest one). When the app declared remote-access ports, their
-        resolved tunnel URLs are (re)written to the ``url`` column. App-provided
-        ``gateway_extra`` columns are merged in before the core-owned fields, so
-        the core always wins on those."""
+        resolved access scopes (local/appliance/cloud) are (re)written to the
+        ``url`` column. App-provided ``gateway_extra`` columns are merged in
+        before the core-owned fields, so the core always wins on those."""
         payload = {
             k: v for k, v in self.gateway.items() if k not in PLATFORM_COLUMNS
         }

@@ -66,46 +66,29 @@ def test_no_ports_by_default_is_empty():
     assert c.ports == []
 
 
-async def test_resolves_each_port_with_metadata():
+async def test_resolves_each_port_with_metadata(monkeypatch):
+    for var in ("DEVICE_KEY", "APP_NAME", "INSTANCE_KEY", "DEVICE_LAN_IP"):
+        monkeypatch.delenv(var, raising=False)
     ports = [
         {"name": "Web interface", "port": 51821, "main": True},
         {"name": "Config API", "port": 8080, "protocol": "http"},
     ]
-    fake = FakeIF(
-        url_map={
-            51821: "https://42-app-51821.app.ironflock.com",
-            8080: "https://42-app-8080.app.ironflock.com",
-        }
-    )
-    c = _collector(ports, fake)
+    c = _collector(ports, FakeIF())
     urls = c._resolve_remote_access_urls()
+    # No platform identity/env -> metadata only; there is deliberately no
+    # ambient `url` field, consumers pick a scope (local/appliance/cloud).
     assert urls == {
-        "51821": {
-            "name": "Web interface",
-            "protocol": "http",
-            "main": True,
-            "url": "https://42-app-51821.app.ironflock.com",
-        },
-        "8080": {
-            "name": "Config API",
-            "protocol": "http",
-            "main": False,
-            "url": "https://42-app-8080.app.ironflock.com",
-        },
+        "51821": {"name": "Web interface", "protocol": "http", "main": True},
+        "8080": {"name": "Config API", "protocol": "http", "main": False},
     }
 
 
-async def test_passes_protocol_and_remote_port_environment_through():
-    ports = [
-        {"name": "VPN", "port": 51820, "protocol": "UDP", "remote_port_environment": "WG_PORT"},
-    ]
-    fake = FakeIF(url_map={51820: "udp://app.ironflock.com:34567"})
-    c = _collector(ports, fake)
-    urls = c._resolve_remote_access_urls()
-    # protocol is lowercased before the SDK call
-    assert fake.calls == [(51820, "udp", "WG_PORT")]
-    assert urls["51820"]["protocol"] == "udp"
-    assert urls["51820"]["url"] == "udp://app.ironflock.com:34567"
+async def test_protocol_is_lowercased():
+    c = _collector(
+        [{"name": "VPN", "port": 51820, "protocol": "UDP", "remote_port_environment": "WG_PORT"}],
+        FakeIF(),
+    )
+    assert c._resolve_remote_access_urls()["51820"]["protocol"] == "udp"
 
 
 async def test_defaults_name_protocol_main():
@@ -116,33 +99,40 @@ async def test_defaults_name_protocol_main():
     assert entry["name"] == "9000"  # falls back to the port number
     assert entry["protocol"] == "http"
     assert entry["main"] is False
-    assert entry["url"] is None  # not in url_map
+    assert "url" not in entry  # legacy field removed in 2.7.0
 
 
-async def test_unresolvable_port_keeps_entry_with_null_url():
-    c = _collector([{"name": "raw", "port": 1883}], FakeIF(resolver_raises=True))
+async def test_sdk_resolver_is_never_called():
+    # URL composition is env-based since 2.7.0; a broken/absent SDK resolver
+    # must not matter and must never be invoked.
+    fake = FakeIF(resolver_raises=True)
+    c = _collector([{"name": "raw", "port": 1883}], fake)
     urls = c._resolve_remote_access_urls()
-    assert set(urls) == {"1883"}
-    assert urls["1883"]["url"] is None
     assert urls["1883"]["name"] == "raw"
+    assert fake.calls == []
 
 
 async def test_invalid_port_spec_is_skipped():
     ports = [{"name": "bad"}, {"name": "ok", "port": 80}]
-    c = _collector(ports, FakeIF(url_map={80: "https://x"}))
+    c = _collector(ports, FakeIF())
     urls = c._resolve_remote_access_urls()
     assert list(urls) == ["80"]  # the bad spec is skipped, only port 80 keyed
 
 
-async def test_old_sdk_without_resolver_yields_null_urls():
+async def test_works_with_old_sdk_without_resolver():
     c = _collector([{"name": "Web", "port": 80}], OldIF())
     urls = c._resolve_remote_access_urls()
-    assert urls["80"]["url"] is None
+    assert urls["80"]["name"] == "Web"
 
 
-async def test_register_gateway_writes_url_column():
+async def test_register_gateway_writes_url_column(monkeypatch):
+    monkeypatch.setenv("DEVICE_KEY", "42")
+    monkeypatch.setenv("APP_NAME", "app")
+    monkeypatch.delenv("INSTANCE_KEY", raising=False)
+    monkeypatch.delenv("TUNNEL_DOMAIN", raising=False)
+    monkeypatch.delenv("IRONFLOCK_ENV_DIR", raising=False)
     ports = [{"name": "Web interface", "port": 51821, "main": True}]
-    fake = FakeIF(url_map={51821: "https://42-app-51821.app.ironflock.com"})
+    fake = FakeIF()
     c = _collector(ports, fake)
     await c.register_gateway()
     (table, payload) = fake.appended[-1]
@@ -153,7 +143,7 @@ async def test_register_gateway_writes_url_column():
             "name": "Web interface",
             "protocol": "http",
             "main": True,
-            "url": "https://42-app-51821.app.ironflock.com",
+            "cloud": {"url": "https://42-app-51821.app.ironflock.com"},
         }
     }
 
@@ -167,16 +157,17 @@ async def test_register_gateway_omits_url_when_no_ports():
     assert "url" not in payload  # inert for apps that declare no ports
 
 
-async def test_register_gateway_recomputes_url_not_echoes_stale():
-    fake = FakeIF(url_map={80: "https://fresh"})
+async def test_register_gateway_recomputes_url_not_echoes_stale(monkeypatch):
+    for var in ("DEVICE_KEY", "APP_NAME", "INSTANCE_KEY", "DEVICE_LAN_IP"):
+        monkeypatch.delenv(var, raising=False)
+    fake = FakeIF()
     c = _collector([{"name": "Web", "port": 80}], fake)
-    # A stale url from a previously loaded gateway row must not survive.
+    # A stale legacy-url entry from a previously loaded gateway row must not
+    # survive — the column is fully recomputed from the current environment.
     c.gateway = {"gateway_name": "dev", "url": {"80": {"name": "Web", "url": "https://stale"}}}
     await c.register_gateway()
     (_, payload) = fake.appended[-1]
-    assert payload["url"] == {
-        "80": {"name": "Web", "protocol": "http", "main": False, "url": "https://fresh"}
-    }
+    assert payload["url"] == {"80": {"name": "Web", "protocol": "http", "main": False}}
 
 
 # ------------------------------------------------------- load_ports_from_template

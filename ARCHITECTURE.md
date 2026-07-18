@@ -76,10 +76,11 @@ Key semantics:
 - **gateways rows are echo-merged**: the core re-appends the existing row's
   columns at startup so user-edited settings survive the registry write.
 - **gateways.url** — remote-access URLs for the gateway, written by the core at
-  registration when the app declares ports (see below). A JSON list of
-  `{name, port, protocol, main, url}`, one entry per declared port, where `url`
-  is the ready-to-use absolute tunnel URL (directly embeddable as an iframe
-  `src`) or null while the tunnel/identity is unavailable. Derived and
+  registration when the app declares ports (see below). A JSON object **keyed by
+  the port number** (string) → `{name, protocol, main, url}`, one entry per
+  declared port, where `url` is the ready-to-use absolute tunnel URL (directly
+  embeddable as an iframe `src`) or null while the tunnel/identity is
+  unavailable. Keyed so the frontend can look a port up directly. Derived and
   core-owned: recomputed from the live tunnel/identity each startup rather than
   echo-merged. Absent when the app declares no ports.
 - **Secrets never go into tables** (boards can read them). Credentials and
@@ -180,9 +181,17 @@ collector = Collector(
 `ports` is a list of port specs — `{name, port, protocol?, main?,
 remote_port_environment?}`, the same shape as the template's `ports:` entries;
 pass a literal list instead of the helper if the app prefers not to depend on
-PyYAML. Each resolved entry is `{name, port, protocol, main, url}`; `url` is a
-ready-to-use absolute URL (iframe `src`) for `http`/`https` ports, or null for a
-`tcp`/`udp` port whose tunnel is not yet up. Resolution is best-effort and never
-blocks registration. Using this feature requires **`ironflock >= 1.5.3`** (the
+PyYAML. The resolved `url` column is a JSON object **keyed by the port number**
+(as a string) → `{name, protocol, main, url}`, so the frontend can index a port
+directly. `url` is a ready-to-use absolute URL (iframe `src`) for `http`/`https`
+ports, or null for a `tcp`/`udp` port whose tunnel is not yet up. For example, a
+`{port: 55000, name: "Config UI", main: true}` spec on device 42 resolves to:
+
+```json
+{ "55000": { "name": "Config UI", "protocol": "http", "main": true,
+             "url": "https://42-app-55000.app.ironflock.com" } }
+```
+
+Resolution is best-effort and never blocks registration. Using this feature requires **`ironflock >= 1.5.3`** (the
 `protocol` / `remote_port_environment` arguments); apps that declare no ports
 are unaffected and keep the old minimum.

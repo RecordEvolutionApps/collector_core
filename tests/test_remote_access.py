@@ -79,22 +79,20 @@ async def test_resolves_each_port_with_metadata():
     )
     c = _collector(ports, fake)
     urls = c._resolve_remote_access_urls()
-    assert urls == [
-        {
+    assert urls == {
+        "51821": {
             "name": "Web interface",
-            "port": 51821,
             "protocol": "http",
             "main": True,
             "url": "https://42-app-51821.app.ironflock.com",
         },
-        {
+        "8080": {
             "name": "Config API",
-            "port": 8080,
             "protocol": "http",
             "main": False,
             "url": "https://42-app-8080.app.ironflock.com",
         },
-    ]
+    }
 
 
 async def test_passes_protocol_and_remote_port_environment_through():
@@ -106,13 +104,15 @@ async def test_passes_protocol_and_remote_port_environment_through():
     urls = c._resolve_remote_access_urls()
     # protocol is lowercased before the SDK call
     assert fake.calls == [(51820, "udp", "WG_PORT")]
-    assert urls[0]["protocol"] == "udp"
-    assert urls[0]["url"] == "udp://app.ironflock.com:34567"
+    assert urls["51820"]["protocol"] == "udp"
+    assert urls["51820"]["url"] == "udp://app.ironflock.com:34567"
 
 
 async def test_defaults_name_protocol_main():
     c = _collector([{"port": 9000}], FakeIF())
-    (entry,) = c._resolve_remote_access_urls()
+    urls = c._resolve_remote_access_urls()
+    assert set(urls) == {"9000"}  # keyed by the port number (string)
+    entry = urls["9000"]
     assert entry["name"] == "9000"  # falls back to the port number
     assert entry["protocol"] == "http"
     assert entry["main"] is False
@@ -121,22 +121,23 @@ async def test_defaults_name_protocol_main():
 
 async def test_unresolvable_port_keeps_entry_with_null_url():
     c = _collector([{"name": "raw", "port": 1883}], FakeIF(resolver_raises=True))
-    (entry,) = c._resolve_remote_access_urls()
-    assert entry["url"] is None
-    assert entry["name"] == "raw" and entry["port"] == 1883
+    urls = c._resolve_remote_access_urls()
+    assert set(urls) == {"1883"}
+    assert urls["1883"]["url"] is None
+    assert urls["1883"]["name"] == "raw"
 
 
 async def test_invalid_port_spec_is_skipped():
     ports = [{"name": "bad"}, {"name": "ok", "port": 80}]
     c = _collector(ports, FakeIF(url_map={80: "https://x"}))
     urls = c._resolve_remote_access_urls()
-    assert [u["port"] for u in urls] == [80]
+    assert list(urls) == ["80"]  # the bad spec is skipped, only port 80 keyed
 
 
 async def test_old_sdk_without_resolver_yields_null_urls():
     c = _collector([{"name": "Web", "port": 80}], OldIF())
-    (entry,) = c._resolve_remote_access_urls()
-    assert entry["url"] is None and entry["port"] == 80
+    urls = c._resolve_remote_access_urls()
+    assert urls["80"]["url"] is None
 
 
 async def test_register_gateway_writes_url_column():
@@ -147,15 +148,14 @@ async def test_register_gateway_writes_url_column():
     (table, payload) = fake.appended[-1]
     assert table == "gateways"
     assert payload["gateway_name"] == "dev"
-    assert payload["url"] == [
-        {
+    assert payload["url"] == {
+        "51821": {
             "name": "Web interface",
-            "port": 51821,
             "protocol": "http",
             "main": True,
             "url": "https://42-app-51821.app.ironflock.com",
         }
-    ]
+    }
 
 
 async def test_register_gateway_omits_url_when_no_ports():
@@ -171,12 +171,12 @@ async def test_register_gateway_recomputes_url_not_echoes_stale():
     fake = FakeIF(url_map={80: "https://fresh"})
     c = _collector([{"name": "Web", "port": 80}], fake)
     # A stale url from a previously loaded gateway row must not survive.
-    c.gateway = {"gateway_name": "dev", "url": [{"name": "Web", "port": 80, "url": "https://stale"}]}
+    c.gateway = {"gateway_name": "dev", "url": {"80": {"name": "Web", "url": "https://stale"}}}
     await c.register_gateway()
     (_, payload) = fake.appended[-1]
-    assert payload["url"] == [
-        {"name": "Web", "port": 80, "protocol": "http", "main": False, "url": "https://fresh"}
-    ]
+    assert payload["url"] == {
+        "80": {"name": "Web", "protocol": "http", "main": False, "url": "https://fresh"}
+    }
 
 
 # ------------------------------------------------------- load_ports_from_template

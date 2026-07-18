@@ -222,21 +222,23 @@ class Collector:
     def _resolve_remote_access_urls(self):
         """Resolve each declared port to its public tunnel URL via the injected SDK.
 
-        Returns a list of ``{name, port, protocol, main, url}`` — one entry per
-        configured port, in template order — for the gateway row's ``url``
-        column. ``url`` is the absolute tunnel URL the SDK composes for that port
-        (ready to use as an iframe ``src``), or ``None`` when the tunnel/identity
-        is not (yet) available (e.g. a tcp/udp port before its tunnel is up).
+        Returns a dict **keyed by the port number** (as a string) mapping to
+        ``{name, protocol, main, url}`` — one entry per configured port — for the
+        gateway row's ``url`` column, so the frontend can look a port up directly
+        (``url["55000"]``) instead of scanning a list. ``url`` is the absolute
+        tunnel URL the SDK composes for that port (ready to use as an iframe
+        ``src``), or ``None`` when the tunnel/identity is not (yet) available
+        (e.g. a tcp/udp port before its tunnel is up).
 
         Best-effort: a port with no numeric ``port`` is skipped, and any SDK
         failure (missing method on an older SDK, resolution error) leaves that
         entry's ``url`` as ``None`` rather than aborting gateway registration.
-        Requires ``ironflock >= 1.5.3`` for the ``protocol`` /
-        ``remote_port_environment`` arguments; on older SDKs every ``url`` is
-        ``None``.
+        If two specs declare the same port the last one wins. Requires
+        ``ironflock >= 1.5.3`` for the ``protocol`` / ``remote_port_environment``
+        arguments; on older SDKs every ``url`` is ``None``.
         """
         resolver = getattr(self.ironflock, "getRemoteAccessUrlForPort", None)
-        urls = []
+        urls = {}
         for spec in self.ports:
             try:
                 port = int(spec["port"])
@@ -255,15 +257,12 @@ class Collector:
                     )
                 except Exception as e:
                     print(f"could not resolve remote-access URL for port {port}: {e}")
-            urls.append(
-                {
-                    "name": spec.get("name") or str(port),
-                    "port": port,
-                    "protocol": protocol,
-                    "main": bool(spec.get("main")),
-                    "url": url,
-                }
-            )
+            urls[str(port)] = {
+                "name": spec.get("name") or str(port),
+                "protocol": protocol,
+                "main": bool(spec.get("main")),
+                "url": url,
+            }
         return urls
 
     async def register_gateway(self):

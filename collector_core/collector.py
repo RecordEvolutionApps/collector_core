@@ -14,6 +14,7 @@ configuration is still read live from the platform.
 """
 
 import asyncio
+import os
 import sys
 import traceback
 from collections import deque
@@ -48,6 +49,87 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _read_injected(name):
+    """Platform-injected value by name: the live env FILE first, env var second.
+
+    The device agent mirrors every injected env var to ``/data/env/{name}.txt``
+    (a bind mount it can update in RUNNING containers — e.g. the cloud port of
+    an instance tunnel, allocated only after the tunnel first connects). The
+    process env is the start-time snapshot and serves as the fallback. Same
+    contract as the ironflock SDK's ``_readInjectedValue``; directory
+    overridable via ``IRONFLOCK_ENV_DIR``.
+    """
+    env_dir = os.environ.get("IRONFLOCK_ENV_DIR", "/data/env")
+    try:
+        with open(os.path.join(env_dir, f"{name}.txt")) as f:
+            value = f.read().strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    return os.environ.get(name)
+
+
+def _tunnel_access_urls(port, protocol, remote_port_environment):
+    """(appliance_url, cloud_url) for a declared port, mirroring the ironflock
+    SDK's ``getRemoteAccessUrlForPort`` label/domain rules — but returning BOTH
+    routes instead of the single preferred one.
+
+    ``cloud`` is the internet-facing URL: on instance (appliance-managed)
+    devices the ``i{INSTANCE_KEY}-``-prefixed route on ``CLOUD_TUNNEL_DOMAIN``;
+    on cloud-managed devices the plain route on ``TUNNEL_DOMAIN`` (which IS the
+    cloud edge there). ``appliance`` is the appliance-network URL — the plain
+    route on the appliance's ``TUNNEL_DOMAIN`` — and exists only on instance
+    devices (``INSTANCE_KEY`` set). Either value is None when the identity /
+    env it needs is unavailable or the tunnel label would be invalid.
+    """
+    instance_key = os.environ.get("INSTANCE_KEY")
+
+    if protocol in ("tcp", "udp"):
+        if not remote_port_environment:
+            return None, None
+        appliance = cloud = None
+        remote_port = _read_injected(remote_port_environment)
+        if remote_port:
+            tunnel_domain = os.environ.get("TUNNEL_DOMAIN", "app.ironflock.com")
+            url = f"{protocol}://{tunnel_domain}:{remote_port}"
+            if instance_key:
+                appliance = url
+            else:
+                cloud = url
+        if instance_key:
+            cloud_port = _read_injected(f"{remote_port_environment}_CLOUD")
+            if cloud_port:
+                cloud_domain = os.environ.get("CLOUD_TUNNEL_DOMAIN", "app.ironflock.com")
+                cloud = f"{protocol}://{cloud_domain}:{cloud_port}"
+        return appliance, cloud
+
+    if protocol not in ("http", "https"):
+        return None, None
+
+    device_key = os.environ.get("DEVICE_KEY")
+    app_name = os.environ.get("APP_NAME")
+    if not (device_key and app_name):
+        return None, None
+
+    label = f"{device_key}-{app_name.lower()}-{port}"
+    if protocol == "https":
+        # https-protocol tunnels get secure- prefixed subdomains platform-wide.
+        label = f"secure-{label}"
+
+    def _url(full_label, domain):
+        # A tunnel label must be a single valid DNS label (CloudURLFor).
+        if len(full_label) > 63 or "." in full_label:
+            return None
+        return f"https://{full_label}.{domain}"
+
+    tunnel_domain = os.environ.get("TUNNEL_DOMAIN", "app.ironflock.com")
+    if instance_key:
+        cloud_domain = os.environ.get("CLOUD_TUNNEL_DOMAIN", "app.ironflock.com")
+        return _url(label, tunnel_domain), _url(f"i{instance_key}-{label}", cloud_domain)
+    return None, _url(label, tunnel_domain)
+
+
 class Collector:
     def __init__(
         self, device_name, device_key, adapter, store_data=True, on_error=None, ports=None
@@ -69,6 +151,12 @@ class Collector:
         # default) leaves the ``url`` column untouched. Use
         # ``Collector.load_ports_from_template()`` to read them from the template.
         self.ports = list(ports) if ports else []
+        # App-provided extra gateway columns, merged into every gateway
+        # registration (register_gateway). Lets an app publish custom columns
+        # it declared in its data-template (e.g. a cluster role) without
+        # fighting the core's echo of existing row values. Core-owned columns
+        # (gateway_name, deleted, info, url, tsp) always win over these.
+        self.gateway_extra: dict = {}
         # Default when the gateway row has no store_data column. With
         # store_data False, configuration is still read live from the
         # platform but collected data is not written to it.
@@ -201,8 +289,6 @@ class Collector:
 
             Collector(..., ports=Collector.load_ports_from_template())
         """
-        import os
-
         if not os.path.exists(path):
             print(f"port template not found at {path}; no remote-access URLs will be published")
             return []
@@ -223,16 +309,33 @@ class Collector:
         """Resolve each declared port to its public tunnel URL via the injected SDK.
 
         Returns a dict **keyed by the port number** (as a string) mapping to
-        ``{name, protocol, main, url}`` — one entry per configured port — for the
-        gateway row's ``url`` column, so the frontend can look a port up directly
-        (``url["55000"]``) instead of scanning a list. ``url`` is the absolute
-        tunnel URL the SDK composes for that port (ready to use as an iframe
-        ``src``), or ``None`` when the tunnel/identity is not (yet) available
-        (e.g. a tcp/udp port before its tunnel is up).
+        ``{name, protocol, main, url, local?, appliance?, cloud?}`` — one entry
+        per configured port — for the gateway row's ``url`` column, so the
+        frontend can look a port up directly (``url["55000"]``) instead of
+        scanning a list. ``url`` is the absolute tunnel URL the SDK composes
+        for that port (ready to use as an iframe ``src``), or ``None`` when
+        the tunnel/identity is not (yet) available (e.g. a tcp/udp port before
+        its tunnel is up) — kept for backward compatibility; it equals the
+        preferred (cloud) route.
+
+        The three access scopes are separate keys, each ``{... , url}`` with a
+        directly usable URL (iframe ``src`` for http/https ports):
+
+        - ``local: {ip, port, url}`` — the LAN endpoint other devices on the
+          same network reach directly (no tunnel). Present when the platform
+          provides ``DEVICE_LAN_IP`` and ``DEVICE_PORT_FOR_<port>`` (the host
+          port from the agent's managed pool).
+        - ``appliance: {url}`` — the appliance-network route on the operator's
+          appliance tunnel domain. Present only on instance devices
+          (``INSTANCE_KEY`` set).
+        - ``cloud: {url}`` — the internet-facing route: the cloud-forwarded
+          ``i{INSTANCE_KEY}-…`` URL on instance devices, the plain tunnel URL
+          on cloud-managed devices. Reachable once the port's tunnel is active.
 
         Best-effort: a port with no numeric ``port`` is skipped, and any SDK
         failure (missing method on an older SDK, resolution error) leaves that
         entry's ``url`` as ``None`` rather than aborting gateway registration.
+        Absent identity/env leaves the corresponding scope key out entirely.
         If two specs declare the same port the last one wins. Requires
         ``ironflock >= 1.5.3`` for the ``protocol`` / ``remote_port_environment``
         arguments; on older SDKs every ``url`` is ``None``.
@@ -257,22 +360,45 @@ class Collector:
                     )
                 except Exception as e:
                     print(f"could not resolve remote-access URL for port {port}: {e}")
-            urls[str(port)] = {
+            entry = {
                 "name": spec.get("name") or str(port),
                 "protocol": protocol,
                 "main": bool(spec.get("main")),
                 "url": url,
             }
+            lan_ip = os.environ.get("DEVICE_LAN_IP")
+            mapped = os.environ.get(f"DEVICE_PORT_FOR_{port}")
+            if lan_ip and mapped:
+                try:
+                    scheme = protocol if protocol in ("https", "tcp", "udp") else "http"
+                    entry["local"] = {
+                        "ip": lan_ip,
+                        "port": int(mapped),
+                        "url": f"{scheme}://{lan_ip}:{int(mapped)}",
+                    }
+                except ValueError:
+                    print(f"ignoring non-numeric DEVICE_PORT_FOR_{port}={mapped!r}")
+            appliance_url, cloud_url = _tunnel_access_urls(
+                port, protocol, remote_port_environment
+            )
+            if appliance_url:
+                entry["appliance"] = {"url": appliance_url}
+            if cloud_url:
+                entry["cloud"] = {"url": cloud_url}
+            urls[str(port)] = entry
         return urls
 
     async def register_gateway(self):
         """Write the registry row, echoing existing columns so user-edited
         gateway settings survive the startup append (the appended row becomes
         the latest one). When the app declared remote-access ports, their
-        resolved tunnel URLs are (re)written to the ``url`` column."""
+        resolved tunnel URLs are (re)written to the ``url`` column. App-provided
+        ``gateway_extra`` columns are merged in before the core-owned fields, so
+        the core always wins on those."""
         payload = {
             k: v for k, v in self.gateway.items() if k not in PLATFORM_COLUMNS
         }
+        payload.update(self.gateway_extra)
         payload["gateway_name"] = self.device_name
         payload["deleted"] = False
         payload["info"] = {

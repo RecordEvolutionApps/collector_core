@@ -212,3 +212,182 @@ def test_load_ports_from_template_no_ports_key(tmp_path):
     tpl = tmp_path / "empty.yml"
     tpl.write_text("something_else: 1\n")
     assert Collector.load_ports_from_template(str(tpl)) == []
+
+
+# ------------------------------------------------- local (LAN) endpoint info
+
+
+async def test_local_endpoint_added_when_platform_env_present(monkeypatch):
+    monkeypatch.setenv("DEVICE_LAN_IP", "192.168.0.21")
+    monkeypatch.setenv("DEVICE_PORT_FOR_50051", "40007")
+    c = _collector([{"name": "Control", "port": 50051, "protocol": "tcp"}], FakeIF())
+    urls = c._resolve_remote_access_urls()
+    assert urls["50051"]["local"] == {
+        "ip": "192.168.0.21",
+        "port": 40007,
+        "url": "tcp://192.168.0.21:40007",
+    }
+
+
+async def test_local_url_uses_http_scheme_for_web_ports(monkeypatch):
+    monkeypatch.setenv("DEVICE_LAN_IP", "192.168.0.21")
+    monkeypatch.setenv("DEVICE_PORT_FOR_55000", "41002")
+    c = _collector([{"name": "Web", "port": 55000}], FakeIF())
+    local = c._resolve_remote_access_urls()["55000"]["local"]
+    assert local["url"] == "http://192.168.0.21:41002"  # iframe-ready
+
+
+async def test_local_endpoint_omitted_without_env(monkeypatch):
+    monkeypatch.delenv("DEVICE_LAN_IP", raising=False)
+    monkeypatch.delenv("DEVICE_PORT_FOR_50051", raising=False)
+    c = _collector([{"name": "Control", "port": 50051}], FakeIF())
+    assert "local" not in c._resolve_remote_access_urls()["50051"]
+
+
+async def test_local_endpoint_omitted_without_mapped_port(monkeypatch):
+    monkeypatch.setenv("DEVICE_LAN_IP", "192.168.0.21")
+    monkeypatch.delenv("DEVICE_PORT_FOR_8080", raising=False)
+    c = _collector([{"name": "Web", "port": 8080}], FakeIF())
+    assert "local" not in c._resolve_remote_access_urls()["8080"]
+
+
+async def test_local_endpoint_ignores_non_numeric_mapped_port(monkeypatch):
+    monkeypatch.setenv("DEVICE_LAN_IP", "192.168.0.21")
+    monkeypatch.setenv("DEVICE_PORT_FOR_80", "not-a-port")
+    c = _collector([{"name": "Web", "port": 80}], FakeIF())
+    assert "local" not in c._resolve_remote_access_urls()["80"]
+
+
+# --------------------------------------------------------------- gateway_extra
+
+
+async def test_register_gateway_merges_gateway_extra():
+    fake = FakeIF()
+    c = Collector(device_name="dev", device_key=42, adapter=_Adapter())
+    c.set_ironflock(fake)
+    c.gateway_extra = {"qds_role": "ui"}
+    await c.register_gateway()
+    (_, payload) = fake.appended[-1]
+    assert payload["qds_role"] == "ui"
+
+
+async def test_gateway_extra_never_overrides_core_columns():
+    fake = FakeIF()
+    c = Collector(device_name="dev", device_key=42, adapter=_Adapter())
+    c.set_ironflock(fake)
+    c.gateway_extra = {"gateway_name": "impostor", "deleted": True, "qds_role": "backend"}
+    await c.register_gateway()
+    (_, payload) = fake.appended[-1]
+    assert payload["gateway_name"] == "dev"
+    assert payload["deleted"] is False
+    assert payload["qds_role"] == "backend"
+
+
+# -------------------------------------------- appliance / cloud tunnel routes
+
+
+def _clear_identity(monkeypatch):
+    for var in ("DEVICE_KEY", "APP_NAME", "INSTANCE_KEY", "TUNNEL_DOMAIN",
+                "CLOUD_TUNNEL_DOMAIN", "IRONFLOCK_ENV_DIR"):
+        monkeypatch.delenv(var, raising=False)
+
+
+async def test_cloud_route_on_cloud_managed_device(monkeypatch):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("DEVICE_KEY", "42")
+    monkeypatch.setenv("APP_NAME", "MyApp")
+    c = _collector([{"name": "Web", "port": 8080}], FakeIF())
+    entry = c._resolve_remote_access_urls()["8080"]
+    # TUNNEL_DOMAIN is the cloud edge here -> cloud route only, no appliance.
+    assert entry["cloud"] == {"url": "https://42-myapp-8080.app.ironflock.com"}
+    assert "appliance" not in entry
+
+
+async def test_appliance_and_cloud_routes_on_instance_device(monkeypatch):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("DEVICE_KEY", "42")
+    monkeypatch.setenv("APP_NAME", "MyApp")
+    monkeypatch.setenv("INSTANCE_KEY", "7")
+    monkeypatch.setenv("TUNNEL_DOMAIN", "tunnel.appliance.lan")
+    c = _collector([{"name": "Web", "port": 8080}], FakeIF())
+    entry = c._resolve_remote_access_urls()["8080"]
+    assert entry["appliance"] == {"url": "https://42-myapp-8080.tunnel.appliance.lan"}
+    assert entry["cloud"] == {"url": "https://i7-42-myapp-8080.app.ironflock.com"}
+
+
+async def test_https_ports_get_secure_prefix(monkeypatch):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("DEVICE_KEY", "42")
+    monkeypatch.setenv("APP_NAME", "MyApp")
+    c = _collector([{"name": "Web", "port": 8443, "protocol": "https"}], FakeIF())
+    entry = c._resolve_remote_access_urls()["8443"]
+    assert entry["cloud"] == {"url": "https://secure-42-myapp-8443.app.ironflock.com"}
+
+
+async def test_tunnel_routes_absent_without_identity(monkeypatch):
+    _clear_identity(monkeypatch)
+    c = _collector([{"name": "Web", "port": 8080}], FakeIF())
+    entry = c._resolve_remote_access_urls()["8080"]
+    assert "appliance" not in entry and "cloud" not in entry
+
+
+async def test_tcp_cloud_route_on_cloud_managed_device(monkeypatch):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("MQTT_PORT", "34567")
+    c = _collector(
+        [{"name": "mqtt", "port": 1883, "protocol": "tcp", "remote_port_environment": "MQTT_PORT"}],
+        FakeIF(),
+    )
+    entry = c._resolve_remote_access_urls()["1883"]
+    assert entry["cloud"] == {"url": "tcp://app.ironflock.com:34567"}
+    assert "appliance" not in entry
+
+
+async def test_tcp_routes_on_instance_device(monkeypatch):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("INSTANCE_KEY", "7")
+    monkeypatch.setenv("TUNNEL_DOMAIN", "tunnel.appliance.lan")
+    monkeypatch.setenv("MQTT_PORT", "34567")
+    monkeypatch.setenv("MQTT_PORT_CLOUD", "45678")
+    c = _collector(
+        [{"name": "mqtt", "port": 1883, "protocol": "tcp", "remote_port_environment": "MQTT_PORT"}],
+        FakeIF(),
+    )
+    entry = c._resolve_remote_access_urls()["1883"]
+    assert entry["appliance"] == {"url": "tcp://tunnel.appliance.lan:34567"}
+    assert entry["cloud"] == {"url": "tcp://app.ironflock.com:45678"}
+
+
+async def test_tcp_instance_without_cloud_port_has_no_cloud_route(monkeypatch):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("INSTANCE_KEY", "7")
+    monkeypatch.setenv("TUNNEL_DOMAIN", "tunnel.appliance.lan")
+    monkeypatch.setenv("MQTT_PORT", "34567")
+    c = _collector(
+        [{"name": "mqtt", "port": 1883, "protocol": "tcp", "remote_port_environment": "MQTT_PORT"}],
+        FakeIF(),
+    )
+    entry = c._resolve_remote_access_urls()["1883"]
+    assert entry["appliance"] == {"url": "tcp://tunnel.appliance.lan:34567"}
+    assert "cloud" not in entry  # cloud port allocated only after tunnel connect
+
+
+async def test_injected_env_file_wins_over_process_env(monkeypatch, tmp_path):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("IRONFLOCK_ENV_DIR", str(tmp_path))
+    (tmp_path / "MQTT_PORT.txt").write_text("40100\n")
+    monkeypatch.setenv("MQTT_PORT", "34567")  # stale start-time snapshot
+    c = _collector(
+        [{"name": "mqtt", "port": 1883, "protocol": "tcp", "remote_port_environment": "MQTT_PORT"}],
+        FakeIF(),
+    )
+    assert c._resolve_remote_access_urls()["1883"]["cloud"] == {"url": "tcp://app.ironflock.com:40100"}
+
+
+async def test_overlong_tunnel_label_yields_no_route(monkeypatch):
+    _clear_identity(monkeypatch)
+    monkeypatch.setenv("DEVICE_KEY", "42")
+    monkeypatch.setenv("APP_NAME", "a" * 70)
+    c = _collector([{"name": "Web", "port": 8080}], FakeIF())
+    entry = c._resolve_remote_access_urls()["8080"]
+    assert "cloud" not in entry and "appliance" not in entry

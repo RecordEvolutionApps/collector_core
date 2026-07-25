@@ -67,7 +67,7 @@ data:
     # (gateway_id, asset_name) — a rename creates a new asset. Apps add
     # connection parameter columns (host, port, endpoint_url, ...).
     - tablename: assets
-      chunkTimeInterval: 1 hour
+      chunkTimeInterval: 1 day
       dropAfter: 3 year
       maintainLatestFlagFor: ['gateway_id', 'asset_name']
       columns:
@@ -114,7 +114,7 @@ data:
     # (upsert + soft-delete). Apps add protocol metadata columns (register
     # offset, object type, node class, port/sensor identity, ...).
     - tablename: datapoints
-      chunkTimeInterval: 1 hour
+      chunkTimeInterval: 1 day
       dropAfter: 3 months
       maintainLatestFlagFor: ['gateway_id', 'asset_name', 'datapoint_id']
       columns:
@@ -165,7 +165,7 @@ data:
     # ...). Rows are snapshots: a row contains the full current state of the
     # asset (push protocols merge last-known values per window).
     - tablename: measurements
-      chunkTimeInterval: 2 day
+      chunkTimeInterval: 1 hour
       dropAfter: 3 months
       columns:
         - id: tsp
@@ -189,7 +189,7 @@ data:
     # paused): latest row per asset = current state, full history =
     # availability log. Fully core-owned; no protocol columns.
     - tablename: assetstatus
-      chunkTimeInterval: 1 month
+      chunkTimeInterval: 1 week
       dropAfter: 3 months
       maintainLatestFlagFor: ['gateway_id', 'asset_name']
       columns:

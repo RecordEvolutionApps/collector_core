@@ -154,6 +154,20 @@ data:
           name: Change Detection
           description: If true, the datapoint is written only when its value differs from the last written value (store-on-change). Missing/null/false stores every reading.
           dataType: boolean
+        - id: demo_value
+          name: Demo Value
+          description: >-
+            Demo mode only - the value this datapoint should sit at, in engineering units (what the board
+            shows, not the raw protocol value). Readings wander around it within demo_variance. Set it to a
+            boolean instead to get a state that rests there. Missing/null keeps the default 0-100 range.
+          dataType: string
+        - id: demo_variance
+          name: Demo Variance
+          description: >-
+            Demo mode only - how far a reading may wander from demo_value (plus/minus, same units); 0 pins it
+            to a constant. For a boolean demo_value it is instead the per-sample chance (0-1) of blipping out
+            of that state. Missing/null means plus/minus 10% of demo_value.
+          dataType: numeric
         - id: deleted
           name: Deleted Flag
           description: Deleted Flag

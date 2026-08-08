@@ -21,19 +21,36 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
 
+from collector_core.demo import DemoSignal
+
 # Columns the platform stamps onto rows it returns; never echo them back.
 PLATFORM_COLUMNS = ("tsp", "latest_flag", "authid", "device_key")
 
-# Datapoints columns owned by the user via the board (per-datapoint pause and
-# change detection), not by protocol discovery. The store preserves them across
-# metadata re-discovery so a device-driven catalog rewrite never clobbers a
-# user's choice; the collector reads them to gate measurement writes.
+# Datapoints columns describing what demo mode should produce for one
+# datapoint, so synthetic data is plausible in context instead of uniform
+# noise (see collector_core.demo). Read live from the catalog, so tuning a
+# demo signal on the board takes effect on the next cycle.
+#  - demo_value:    the value the reading should sit at, in ENGINEERING units.
+#                   A boolean makes it a state that rests there. Null/missing
+#                   keeps demo mode's historical 0..100 range.
+#  - demo_variance: how far it may wander around demo_value (+-, same units);
+#                   for a boolean, the per-sample chance of blipping out of it.
+#                   Null/missing means +-10% of demo_value.
+DEMO_DATAPOINT_COLUMNS = ("demo_value", "demo_variance")
+
+# Datapoints columns owned by the user via the board (per-datapoint pause,
+# change detection and demo tuning), not by protocol discovery. The store
+# preserves them across metadata re-discovery so a device-driven catalog
+# rewrite never clobbers a user's choice; the collector reads them to gate
+# measurement writes and to shape demo values.
 #  - enabled:          pause switch, null-safe (only an explicit false pauses;
 #                      missing/null means the datapoint is collected).
 #  - change_detection: when true, the datapoint is written only when its value
 #                      differs from the last written value (missing/null/false
 #                      stores every reading).
-USER_DATAPOINT_COLUMNS = ("enabled", "change_detection")
+# An adapter that resolves one of these from its own spec still wins: the store
+# only fills in a column the adapter's payload does not carry.
+USER_DATAPOINT_COLUMNS = ("enabled", "change_detection") + DEMO_DATAPOINT_COLUMNS
 
 
 def _now():
@@ -265,11 +282,41 @@ class ProtocolSession(ABC):
             f"{type(self).__name__} must implement read_values() or override stream()"
         )
 
-    @abstractmethod
+    @property
+    def demo_signal(self) -> DemoSignal:
+        """This session's demo generator, created on first use.
+
+        Lazy rather than constructed in ``__init__`` because sessions define
+        their own constructors and are not required to call ``super()``. The
+        walk state lives here, so it must be one instance for the session's
+        whole life — never create a fresh one per cycle.
+        """
+        signal = getattr(self, "_demo_signal", None)
+        if signal is None:
+            signal = self._demo_signal = DemoSignal()
+        return signal
+
     def demo_values(self, datapoints) -> dict:
         """Return synthetic ``{datapoint_id: raw_value}`` for demo mode, in
         the same raw shape ``read_values``/``stream`` produce so
-        ``format_value`` and ``make_entry`` work identically."""
+        ``format_value`` and ``make_entry`` work identically.
+
+        The default returns the core's synthetic scalars, shaped by each
+        datapoint's ``demo_value``/``demo_variance`` (see
+        ``collector_core.demo``) — correct for protocols whose raw value IS
+        the scalar. A protocol with a richer raw shape (a dict carrying
+        quality and a source timestamp) overrides this and wraps
+        ``self.demo_signal.value(datapoint)`` in its own shape, so the demo
+        config keeps working.
+
+        The scalars are in engineering units: do not apply a raw-to-engineering
+        ``scale`` to them in ``format_value``.
+        """
+        return {
+            datapoint["id"]: self.demo_signal.value(datapoint)
+            for datapoint in datapoints
+            if datapoint.get("id")
+        }
 
     async def close(self) -> None:
         """Release any persistent resources. No-op for stateless protocols.

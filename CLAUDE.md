@@ -30,10 +30,11 @@ pytest runs with `asyncio_mode = "auto"` — async test functions need no decora
 
 ## Code layout
 
-Four modules in `collector_core/`:
+Five modules in `collector_core/`:
 
 - `collector.py` — the `Collector` class: gateway registration/settings (including resolving the app's declared `ports` to remote-access URLs for the gateway `url` column), asset config + live subscription handlers, per-asset task management, the collection loop (`collect_asset` → `_publish_batch`), buffered outbound writes (`_flush_loop`), and error reporting (`report_error`/`report_exception`).
 - `adapter.py` — the protocol seam: `ProtocolAdapter`, `ProtocolSession` (default `stream` = poll loop; push protocols override), `DatapointStore`, `DatapointsChanged`.
+- `demo.py` — `DemoSignal`: per-datapoint synthetic values for demo mode, a mean-reverting random walk around the `demo_value`/`demo_variance` catalog columns (booleans rest in a state and blip out of it). Values are in **engineering units** — adapters must not `scale` them. State lives in the instance, so it is one per session (`ProtocolSession.demo_signal`), never one per cycle.
 - `errors.py` — typed error hierarchy. All reportable failures are `CollectorError` subclasses carrying a technical message plus an operator-facing `user_message`. `DatapointsChanged` is deliberately NOT a `CollectorError` — it is a control signal for datapoint re-discovery, so `except CollectorError` must never swallow it.
 - `data-template.yml` — canonical core table schema every app's own template must include.
 

@@ -22,6 +22,7 @@ from contextlib import aclosing
 from datetime import datetime, timezone
 
 from collector_core.adapter import (
+    DEMO_DATAPOINT_COLUMNS,
     PLATFORM_COLUMNS,
     DatapointStore,
     DatapointsChanged,
@@ -788,6 +789,30 @@ class Collector:
             if row.get("asset_name") == asset_name
         }
 
+    def _with_demo_config(self, asset_name, datapoints):
+        """Datapoint dicts with the catalog's demo settings merged in.
+
+        Demo tuning is edited on the board, so for a discovered catalog the
+        live row is the only place it exists — the adapter's resolved dicts
+        know nothing about it. The row also wins where both carry a value: an
+        adapter that resolves demo settings from its own spec has already
+        written them there, so the row is never staler.
+
+        Returns the originals untouched when there is nothing to merge, so the
+        common (unconfigured) case allocates nothing per cycle.
+        """
+        catalog = self._datapoint_catalog(asset_name)
+        merged = []
+        for datapoint in datapoints:
+            row = catalog.get(datapoint.get("id")) or {}
+            demo = {
+                column: row[column]
+                for column in DEMO_DATAPOINT_COLUMNS
+                if row.get(column) is not None
+            }
+            merged.append({**datapoint, **demo} if demo else datapoint)
+        return merged
+
     def _clear_datapoint_values(self, asset_name):
         """Drop the change-detection cache for a removed asset."""
         for key in [k for k in self._last_values if k[0] == asset_name]:
@@ -871,8 +896,9 @@ class Collector:
                     # since no server-side subscription exists in demo mode.
                     while True:
                         datapoints = await provider()
+                        demo = self._with_demo_config(asset_name, datapoints)
                         if await self._publish_batch(
-                            asset, datapoints, session.demo_values(datapoints)
+                            asset, datapoints, session.demo_values(demo)
                         ):
                             await self._mark_online(asset)
                         await asyncio.sleep(interval)

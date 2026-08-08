@@ -17,6 +17,7 @@ platform templates.
 │                      subscriptions, one task per asset, measurements      │
 │                      assembly, assetstatus tracking, store_data gating    │
 │ DatapointStore     — column-agnostic datapoints catalog (upsert/prune)    │
+│ DemoSignal         — per-datapoint synthetic values for demo mode         │
 │ ProtocolAdapter/ProtocolSession/DatapointsChanged — the protocol seam     │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
@@ -32,7 +33,7 @@ the core columns and may extend them with protocol-specific columns.
 |---|---|---|---|
 | `gateways` | registry + per-gateway settings | gateway_name | tsp, gateway_name, deleted, store_data, info (json), url (json) |
 | `assets` | connected protocol endpoints | gateway_id, asset_name | tsp, asset_name, gateway_id, datapoint_spec, collect_interval, enabled, demo_mode, deleted |
-| `datapoints` | value-stream catalog per asset | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, enabled, change_detection, deleted |
+| `datapoints` | value-stream catalog per asset | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, enabled, change_detection, demo_value, demo_variance, deleted |
 | `measurements` | timeseries recordings | — (append-only) | tsp, asset_name, gateway_id, data (json) |
 | `assetstatus` | state transitions (core-owned) | gateway_id, asset_name | tsp, asset_name, gateway_id, status, detail, deleted |
 
@@ -57,6 +58,16 @@ Key semantics:
   baseline). Both are user-owned: the store preserves them across metadata
   re-discovery (`USER_DATAPOINT_COLUMNS`). Defaults (null) keep the prior
   full-snapshot behaviour.
+- **datapoints.demo_value / datapoints.demo_variance** — what demo mode should
+  produce for this datapoint, so synthetic data is plausible in context (a
+  temperature sits at 75 °C ±2, not a random 0–100). `demo_value` is the value
+  the reading sits at, in **engineering units** — adapters must not apply their
+  raw-to-engineering `scale` on top of it; `demo_variance` is how far it may
+  wander (± , same units; `0` pins it to a constant). A boolean `demo_value`
+  instead gives a state resting there, with `demo_variance` as the per-sample
+  chance of blipping out of it. Both null = the historical 0–100 range. Also
+  user-owned and preserved across re-discovery, and read live from the catalog,
+  so board edits apply on the next cycle. See [Demo mode](#demo-mode).
 - **measurements.data** — `{datapoint_id: {name, units, value, ...extras}}`.
   Rows are **snapshots**: each row carries the asset's full current state
   (push protocols merge last-known values per window); changes-only rows are
@@ -110,7 +121,8 @@ Key semantics:
 |---|---|---|
 | `stream(datapoints_provider, interval)` | overridable async generator | Yields `(datapoints, {datapoint_id: raw})` batches forever. **Default = poll loop** (provider → `read_values` → yield → sleep). Push protocols override: subscribe and yield one merged batch per window |
 | `read_values(datapoints)` | default raises | Pull protocols implement; one poll cycle, raises on failure |
-| `demo_values(datapoints)` | abstract | Synthetic raw values in the **same shape** as the real path |
+| `demo_values(datapoints)` | overridable | Synthetic raw values in the **same shape** as the real path. **Default = the core's per-datapoint scalars**; override only for a richer raw shape |
+| `demo_signal` | property | The session's `DemoSignal` (lazy, one per session). An override calls `self.demo_signal.value(dp)` for the number |
 | `close()` | overridable | Idempotent teardown; always awaited by the core |
 
 `DatapointsChanged` may be raised mid-stream when the source's datapoint set
@@ -129,6 +141,37 @@ Stream contract details:
 - `stream` is not called in demo mode — the core paces `demo_values` itself,
   which is why it must work without any server.
 - Push overrides must keep accumulation bounded (merge by datapoint id).
+
+## Demo mode
+
+`assets.demo_mode` makes an asset produce synthetic data instead of reading a
+device, so names, units, dashboards and alarm limits can be checked before the
+hardware is reachable. The core paces it (`stream` is never called) and shapes
+the values from the two per-datapoint columns above.
+
+`collector_core.demo.DemoSignal` turns them into a **mean-reverting random
+walk**: each sample steps from the previous one and is pulled back towards
+`demo_value`, staying inside the band. Consecutive readings are therefore
+correlated — a wandering line on a chart rather than a hairbrush, which is what
+makes a demo dashboard judgeable at all. Unparsable settings fall back to the
+defaults instead of raising: one mistyped datapoint must not take an asset's
+demo stream down.
+
+Protocols whose raw value **is** the scalar need nothing — the default
+`demo_values` already returns core-shaped values. A protocol with a richer raw
+shape wraps the number:
+
+```python
+def demo_values(self, datapoints):
+    return {dp["id"]: {"value": self.demo_signal.value(dp),
+                       "quality": "good", "source_tsp": _now()}
+            for dp in datapoints if dp.get("id")}
+```
+
+Two rules for adapters: keep **one** `DemoSignal` for the session's lifetime
+(the walk state lives in it — `self.demo_signal` handles this), and do not
+apply `scale` to a demo value in `format_value`, since it is already in
+engineering units.
 
 ## Per-protocol mapping
 

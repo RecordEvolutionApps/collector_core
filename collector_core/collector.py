@@ -131,6 +131,22 @@ def _tunnel_access_urls(port, protocol, remote_port_environment):
     return None, _url(label, tunnel_domain)
 
 
+def outage_cause(exc):
+    """Name the layer behind a failed platform write, for the outage log line.
+
+    The collector only ever sees the exception the SDK raises, but its text
+    often carries the platform's own error. The one worth telling apart is
+    the platform's table service failing to reach *its* Postgres (pg-pool
+    reporting ECONNREFUSED on port 5432): the gateway's link to the router
+    is fine, and nothing on the gateway can fix it. Everything else stays
+    the generic "link down" (router unreachable, auth, timeouts).
+    """
+    text = str(exc)
+    if "ECONNREFUSED" in text and ("5432" in text or "pg-pool" in text):
+        return "platform database unreachable (platform-side, not the gateway link)"
+    return "link down"
+
+
 class Collector:
     def __init__(
         self, device_name, device_key, adapter, store_data=True, on_error=None, ports=None
@@ -721,7 +737,7 @@ class Collector:
                     # Still down: re-queue everything not yet sent, in order.
                     self._buffer.extendleft(reversed(pending[i:]))
                     self._link_down = True
-                    print(f"buffered {len(self._buffer)} row(s); link down: {e}")
+                    print(f"buffered {len(self._buffer)} row(s); {outage_cause(e)}: {e}")
                     return
                 i = j
 

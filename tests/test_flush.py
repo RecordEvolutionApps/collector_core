@@ -3,7 +3,7 @@
 from collections import deque
 
 from collector_core.adapter import ProtocolAdapter
-from collector_core.collector import BULK_CHUNK_MAX, Collector
+from collector_core.collector import BULK_CHUNK_MAX, Collector, outage_cause
 
 
 class _Adapter(ProtocolAdapter):
@@ -83,3 +83,34 @@ async def test_empty_buffer_is_noop():
     c = _collector([])
     await c._flush()
     assert c.ironflock.calls == [] and not c._buffer
+
+
+PG_ERROR = (
+    "Bulk append of 2 row(s) to table 'measurements' failed with WAMP error "
+    "'wamp.error.runtime_error' — [{\"errno\": -111, \"syscall\": \"connect\", "
+    "\"port\": 5432, \"address\": \"34.118.231.19\", \"code\": \"ECONNREFUSED\", "
+    "\"stack\": \"Error: connect ECONNREFUSED 34.118.231.19:5432\\n at "
+    "(node_modules/pg-pool/index.js:45:11)\"}]"
+)
+
+
+def test_outage_cause_names_platform_database():
+    assert outage_cause(RuntimeError(PG_ERROR)).startswith("platform database unreachable")
+    # The gateway's own refused connection to the router is not the database.
+    assert outage_cause(RuntimeError("connect ECONNREFUSED 10.0.0.1:8080")) == "link down"
+    assert outage_cause(RuntimeError("timeout")) == "link down"
+
+
+async def test_flush_log_line_names_platform_database(capsys):
+    c = _collector([("measurements", "m1")], fail_on="measurements")
+    c.ironflock.append_rows_to_table = _raise(PG_ERROR)
+    await c._flush()
+    out = capsys.readouterr().out
+    assert "buffered 1 row(s); platform database unreachable" in out
+    assert c._link_down and list(c._buffer) == [("measurements", "m1")]
+
+
+def _raise(text):
+    async def fail(table, rows):
+        raise RuntimeError(text)
+    return fail

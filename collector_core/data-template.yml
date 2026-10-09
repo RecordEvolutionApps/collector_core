@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://gist.githubusercontent.com/markope/80d99a0bb28cd602cc4a0af790086163/raw/ironflock-data-template-schema.yml
+# yaml-language-server: $schema=https://ironflock.com/schemas/data-template/v1.yml
 #
 # CANONICAL CORE TABLE CONTRACT for IronFlock collector apps
 # ----------------------------------------------------------

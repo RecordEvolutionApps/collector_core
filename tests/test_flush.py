@@ -1,6 +1,9 @@
 """Buffer catch-up: bulk insert, per-table grouping, chunk cap, failure re-queue."""
 
+import asyncio
 from collections import deque
+
+import pytest
 
 from collector_core.adapter import ProtocolAdapter
 from collector_core.collector import BULK_CHUNK_MAX, Collector, outage_cause
@@ -114,3 +117,57 @@ def _raise(text):
     async def fail(table, rows):
         raise RuntimeError(text)
     return fail
+
+
+class GatedIF(FakeIF):
+    """Holds every write until ``gate`` opens."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.gate = asyncio.Event()
+
+    async def append_rows_to_table(self, table, rows):
+        await self.gate.wait()
+        await super().append_rows_to_table(table, rows)
+
+
+async def test_a_caller_cancelled_mid_write_loses_no_row():
+    """The drain usually runs inside an asset's collection task, which an app
+    cancels on every edit of that asset. The rows the drain took out of the
+    shared buffer - other assets' too - must still be written, and only
+    once: the write in flight may already have landed, so putting the rows
+    back would duplicate them."""
+    c = Collector(device_name="d", device_key=1, adapter=_Adapter())
+    c.set_ironflock(GatedIF())
+    c._buffer = deque([("measurements", "b1"), ("measurements", "b2"), ("assetstatus", "a1")])
+    caller = asyncio.ensure_future(c._flush())
+    await asyncio.sleep(0.01)                 # the drain took the rows; the write waits
+    assert not c._buffer
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    c.ironflock.gate.set()
+    for _ in range(100):
+        if len(c.ironflock.calls) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert c.ironflock.calls == [("measurements", ["b1", "b2"]), ("assetstatus", ["a1"])]
+    assert not c._buffer and not c._draining
+
+
+async def test_a_send_cancelled_mid_write_still_delivers_its_row():
+    c = Collector(device_name="d", device_key=1, adapter=_Adapter())
+    c.set_ironflock(GatedIF())
+    c._buffer = deque([("measurements", {"asset_name": "B", "data": {}})])
+    task = asyncio.ensure_future(c._send("measurements", {"asset_name": "A", "data": {}}))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    c.ironflock.gate.set()
+    for _ in range(100):
+        if c.ironflock.calls:
+            break
+        await asyncio.sleep(0.01)
+    (call,) = c.ironflock.calls
+    assert [row["asset_name"] for row in call[1]] == ["B", "A"]

@@ -258,6 +258,7 @@ class Collector:
         # the cloud link was down; drained in order on reconnect.
         self._buffer = deque(maxlen=DEFAULT_BUFFER_SIZE)
         self._flush_lock = asyncio.Lock()
+        self._draining = set()
         # Cloud-link outage bookkeeping, used to inform the operator once on
         # recovery (never during the outage, when reporting can't get through):
         # whether the last flush attempt failed, and how many buffered rows the
@@ -785,7 +786,27 @@ class Collector:
         await self._flush()
 
     async def _flush(self):
-        """Drain the buffer oldest-first while the link is up.
+        """Drain the buffer oldest-first while the link is up (``_drain``).
+
+        The drain runs shielded from whoever awaits it. That is usually an
+        asset's collection task, inside ``_send``, and an app cancels that
+        task whenever it reconfigures the asset (every row edit). Cancelled
+        mid-write, an unshielded drain would drop every row it had taken out
+        of the shared buffer - other assets' rows included - and putting them
+        back instead could write a chunk twice, since the write may already
+        have landed. Shielded, the drain finishes: each row is written once,
+        or re-queued by the failure path as usual. The caller still sees its
+        cancellation.
+        """
+        drain = asyncio.ensure_future(self._drain())
+        # Held until it ends: once its caller is gone, nothing else references
+        # it, and the loop keeps tasks only weakly.
+        self._draining.add(drain)
+        drain.add_done_callback(self._draining.discard)
+        await asyncio.shield(drain)
+
+    async def _drain(self):
+        """The flush itself.
 
         Rows are sent with the SDK's bulk ``append_rows_to_table``: the backlog
         is snapshotted (bounded to the current length so concurrently appended

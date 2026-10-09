@@ -97,6 +97,13 @@ Key semantics:
   reports go through the same repair, and `Collector.run` sets stdout/stderr
   to `backslashreplace`, so logging such text cannot end an asset's task. A
   healthy write path prints nothing.
+- **A cancelled caller never takes buffered rows with it.** The flush that
+  `_send` triggers runs inside an asset's collection task, which an app
+  cancels whenever it reconfigures that asset (every row edit). The drain
+  therefore runs shielded: the rows it took out of the shared buffer - every
+  asset's, not only the cancelled one's - are written once, or re-queued if
+  the write fails, whatever happens to the caller. (Up to v2.7.1 they were
+  lost; putting them back instead could write a chunk twice.)
 - **Latest entity rows are kept alive.** Table retention (`dropAfter`) drops
   whole chunks, the latest row of an entity included, so a datapoint or an
   asset status that never changes would age out — and with it the user's

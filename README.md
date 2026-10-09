@@ -90,7 +90,9 @@ arguments; apps that declare no ports stay on the 1.4.1 floor.
 
 Every app that pins this repo — the collector family listed at the top
 (`iolink_collector`, `modbus_collector`, `mtconnect_collector`,
-`bacnet_collector`, `plc_collector`). An app keeps running on its old pinned tag
+`bacnet_collector`, `plc_collector`, `mqtt_collector`, `smartview`,
+`TRUMPF_QDS`) and `data_relay`, which imports `collector_core.errors`. Find
+them with `grep -rn collector_core.git ../*/requirements.txt ../*/*/requirements.txt`. An app keeps running on its old pinned tag
 until you bump it, so apps can be migrated one at a time.
 
 ### Verify

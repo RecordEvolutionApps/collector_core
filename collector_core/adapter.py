@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from collector_core.demo import DemoSignal
+from collector_core.storable import repair_text, storable
 
 # Columns the platform stamps onto rows it returns; never echo them back.
 PLATFORM_COLUMNS = ("tsp", "latest_flag", "authid", "device_key")
@@ -72,7 +73,11 @@ async def emit_error(ironflock, message, level="error", user_message=None):
     if ironflock is None:
         return
     try:
-        await ironflock.report_error(str(message), level=level, user_message=user_message)
+        # A message quoting device data (an exception text, a value) can carry a
+        # lone surrogate; repaired, the toast still reaches the board.
+        text = repair_text(str(message))
+        shown = None if user_message is None else repair_text(str(user_message))
+        await ironflock.report_error(text, level=level, user_message=shown)
     except Exception as e:
         print(f"report_error failed: {e}")
 
@@ -164,6 +169,11 @@ class DatapointStore:
         """
         stored = 0
         for payload in payloads:
+            # Cleaned before the comparison, so a repaired row matches its
+            # stored copy next time instead of being rewritten on every call.
+            payload, problems = storable(payload)
+            if problems:
+                print(f"repaired datapoint {payload.get('datapoint_id')!r} ({', '.join(problems)})")
             current = next(
                 (
                     row
@@ -208,6 +218,7 @@ class DatapointStore:
             payload = {k: v for k, v in row.items() if k not in PLATFORM_COLUMNS}
             payload["deleted"] = True
             payload["tsp"] = _now()
+            payload, _ = storable(payload)
             print("deleting stale datapoint", payload)
             if self.store_data:
                 await self._ironflock.append_to_table("datapoints", payload)

@@ -86,6 +86,26 @@ Key semantics:
   remain active.
 - **gateways rows are echo-merged**: the core re-appends the existing row's
   columns at startup so user-edited settings survive the registry write.
+- **Rows are made storable before they are buffered.** Measurements and
+  assetstatus share one bounded buffer, and a row the platform cannot carry
+  (a lone surrogate from a JSON escape, NaN/Infinity, an integer outside
+  64 bits, a set or other object) used to stay at its head and block every
+  asset's writes. `collector_core.storable` repairs such values instead of
+  dropping the row — bad code points are escaped, non-finite floats become
+  null, the rest become text — and the core reports the repair as a warning
+  at most once an hour per asset, table and kind. Catalog writes and error
+  reports go through the same repair, and `Collector.run` sets stdout/stderr
+  to `backslashreplace`, so logging such text cannot end an asset's task. A
+  healthy write path prints nothing.
+- **Latest entity rows are kept alive.** Table retention (`dropAfter`) drops
+  whole chunks, the latest row of an entity included, so a datapoint or an
+  asset status that never changes would age out — and with it the user's
+  per-datapoint settings. Every `REASSERT_INTERVAL` (6 h) the core rewrites
+  the full latest `datapoints` rows and `assetstatus` rows it owns that are
+  older than `Collector.reassert_after` (default 7 days). Keep every app's
+  `dropAfter` for those tables far above that. `assets` rows are not
+  rewritten (a rewrite restarts the asset's task); the template keeps them
+  for 3 years.
 - **gateways.url** — remote-access URLs for the gateway, written by the core at
   registration when the app declares ports (see below). A JSON object **keyed by
   the port number** (string) → `{name, protocol, main, url}`, one entry per

@@ -16,6 +16,7 @@ configuration is still read live from the platform.
 import asyncio
 import os
 import sys
+import time
 import traceback
 from collections import deque
 from contextlib import aclosing
@@ -29,6 +30,7 @@ from collector_core.adapter import (
     emit_error,
 )
 from collector_core.errors import CollectorError
+from collector_core.storable import storable
 
 # Max data rows buffered locally while the cloud link is down, when the
 # gateway row sets no buffer_size. Oldest rows are dropped on overflow.
@@ -45,9 +47,69 @@ BULK_CHUNK_MAX = 5000
 # None reading is distinguished from a datapoint that has never been published.
 _UNSET = object()
 
+# Keeping entity rows alive. Table retention (dropAfter) drops whole chunks,
+# the latest row of an entity included, so a catalog row or an asset status
+# that never changes ages out of its table: the board loses the datapoint and
+# the user's per-datapoint pause / change-detection choice with it. The core
+# rewrites the latest datapoints and assetstatus rows it owns once they are
+# older than REASSERT_AFTER (seconds), checking every REASSERT_INTERVAL. Both
+# must stay far below the shortest dropAfter an app gives those tables (the
+# core template uses 3 months).
+REASSERT_AFTER = 7 * 24 * 3600
+REASSERT_INTERVAL = 6 * 3600
+
+# A repaired (unstorable) row is reported at most once per asset, table and
+# kind of repair in this window, so a device sending bad values every second
+# produces one toast an hour, not one per row.
+REPAIR_REPORT_INTERVAL = 3600
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _epoch_seconds(value):
+    """A row's ``tsp`` as epoch seconds, or None when it cannot be read.
+
+    History reads return timestamps as epoch milliseconds, the core's own
+    writes and the table events carry ISO strings, and a test may pass a
+    datetime; all three must agree for the keep-alive to judge a row's age.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return moment.timestamp()
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > 1e11 else float(value)
+    text = str(value).strip()
+    try:
+        return _epoch_seconds(float(text))
+    except ValueError:
+        pass
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _epoch_seconds(moment)
+
+
+def _tolerate_unencodable_output(streams=None):
+    """Let the process log any text, lone surrogates included.
+
+    The core and its adapters print device-derived text (an exception quoting
+    a payload, a datapoint name). In the app image stdout is strict UTF-8, so
+    printing a lone surrogate raises UnicodeEncodeError — inside the very
+    handler that reports a failed asset, which then ends the asset's task.
+    ``backslashreplace`` prints such a character as ``\\ud800`` instead.
+    ``Collector.run`` is the app's main function, so the process is the
+    core's to configure.
+    """
+    for stream in streams if streams is not None else (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass  # not a TextIOWrapper (pytest capture, a pipe wrapper): leave it
 
 
 def _read_injected(name):
@@ -202,6 +264,15 @@ class Collector:
         # bounded buffer dropped (oldest-first) while the link was down.
         self._link_down = False
         self._dropped_rows = 0
+        # Last write per asset of its assetstatus row: (monotonic time, the
+        # row's status and detail), so the keep-alive can rewrite it before
+        # retention drops it.
+        self._status_written: dict[str, tuple] = {}
+        # (asset, table, repairs) -> monotonic time of its last report.
+        self._repair_reported: dict[tuple, float] = {}
+        # Overridable per instance (tests, apps with an unusually short
+        # dropAfter); see REASSERT_AFTER.
+        self.reassert_after = REASSERT_AFTER
 
     def set_ironflock(self, ironflock):
         """Provide the IronFlock handle used for all table I/O. Must be called
@@ -459,6 +530,7 @@ class Collector:
             "deleted": False,
         }
         print("asset status:", row)
+        self._status_written[asset_name] = (time.monotonic(), status, row["detail"])
         await self._send("assetstatus", row)
         return True
 
@@ -466,6 +538,7 @@ class Collector:
         """Soft-delete the status stream of a removed asset."""
         asset_name = asset["asset_name"]
         self._asset_status.pop(asset_name, None)
+        self._status_written.pop(asset_name, None)
         row = {
             "tsp": _now(),
             "asset_name": asset_name,
@@ -695,9 +768,17 @@ class Collector:
         opportunistic flush is attempted; a network failure leaves the row
         (and any backlog) buffered for the next flush instead of raising, so
         collection keeps running during a cloud outage.
+
+        The row is made storable first (see ``collector_core.storable``). This
+        is the one door into the shared buffer, and a row the platform cannot
+        encode would otherwise sit at the buffer's head and block every asset's
+        writes; a repaired row is written, and the repair is reported.
         """
         if not self.store_data:
             return
+        payload, problems = storable(payload)
+        if problems:
+            await self._report_repair(table, payload, problems)
         if self._buffer.maxlen is not None and len(self._buffer) >= self._buffer.maxlen:
             self._dropped_rows += 1  # deque drops the oldest row silently
         self._buffer.append((table, payload))
@@ -763,6 +844,97 @@ class Collector:
                         level="info",
                         user_message="Connection restored — all buffered readings were delivered.",
                     )
+
+    async def _report_repair(self, table, payload, problems):
+        """Tell the operator once an hour per asset, table and kind of repair."""
+        asset_name = payload.get("asset_name") if isinstance(payload, dict) else None
+        key = (asset_name, table, tuple(problems))
+        now = time.monotonic()
+        last = self._repair_reported.get(key)
+        if last is not None and now - last < REPAIR_REPORT_INTERVAL:
+            return
+        self._repair_reported[key] = now
+        what = ", ".join(problems)
+        await self.report_error(
+            f"repaired a {table} row the platform could not store ({what})",
+            level="warn",
+            asset_name=asset_name,
+            user_message=(
+                f"'{asset_name}' sent a value the platform cannot store ({what}). "
+                "It was stored in a repaired form."
+                if asset_name
+                else f"A value the platform cannot store ({what}) was stored in a repaired form."
+            ),
+        )
+
+    async def reassert_stale_rows(self):
+        """Rewrite the latest datapoints and assetstatus rows older than
+        ``reassert_after``, so table retention never drops a live entity.
+
+        Writes full rows, not identity-only ones: the content comes from the
+        in-memory catalog (kept current by the table subscription) and the
+        last status write, which keeps the rewrite correct on a platform
+        without carry-over merges too. Only rows nobody touched for days are
+        rewritten, so a concurrent edit is not plausibly reverted. Returns the
+        number of rows written; never raises — a failure is retried on the
+        next pass.
+        """
+        if not self.store_data or self.ironflock is None:
+            return 0
+        written = 0
+        cutoff = time.time() - self.reassert_after
+        stamp = _now()
+
+        stale = []
+        for row in list(self.datapoints):
+            when = _epoch_seconds(row.get("tsp"))
+            if when is None or when >= cutoff:
+                continue
+            payload = {k: v for k, v in row.items() if k not in PLATFORM_COLUMNS}
+            payload["tsp"] = stamp
+            stale.append((row, payload))
+        for i in range(0, len(stale), BULK_CHUNK_MAX):
+            chunk = stale[i : i + BULK_CHUNK_MAX]
+            rows = [storable(payload)[0] for _, payload in chunk]
+            try:
+                await self.ironflock.append_rows_to_table("datapoints", rows)
+            except Exception as e:
+                print(f"keep-alive of {len(rows)} datapoint row(s) failed: {e}")
+                break
+            for row, _ in chunk:
+                row["tsp"] = stamp  # until the subscription echoes the new row
+            written += len(rows)
+
+        monotonic_cutoff = time.monotonic() - self.reassert_after
+        for asset_name, (when, status, detail) in list(self._status_written.items()):
+            if when >= monotonic_cutoff or self._asset_status.get(asset_name) != status:
+                continue
+            self._status_written[asset_name] = (time.monotonic(), status, detail)
+            await self._send(
+                "assetstatus",
+                {
+                    "tsp": stamp,
+                    "asset_name": asset_name,
+                    "gateway_id": self.device_key,
+                    "status": status,
+                    "detail": detail,
+                    "deleted": False,
+                },
+            )
+            written += 1
+
+        if written:
+            print(f"keep-alive: rewrote {written} row(s) older than {self.reassert_after}s")
+        return written
+
+    async def _reassert_loop(self):
+        """Run the keep-alive every REASSERT_INTERVAL; see REASSERT_AFTER."""
+        while True:
+            await asyncio.sleep(REASSERT_INTERVAL)
+            try:
+                await self.reassert_stale_rows()
+            except Exception as e:
+                print(f"keep-alive loop error: {e}")
 
     async def _flush_loop(self):
         """Periodically retry draining the buffer, so a backlog is sent on
@@ -875,7 +1047,6 @@ class Collector:
 
         if not payload["data"]:
             return False
-        print(payload)
         await self._send("measurements", payload)
         return True
 
@@ -953,6 +1124,7 @@ class Collector:
     # ------------------------------------------------------------------- run
 
     async def run(self):
+        _tolerate_unencodable_output()
         try:
             await self.load_gateway()
             try:
@@ -973,6 +1145,9 @@ class Collector:
 
             # Drains the offline buffer on reconnect even when no new data flows.
             asyncio.create_task(self._flush_loop())
+            # Rewrites long-unchanged catalog and status rows before table
+            # retention can drop them (see REASSERT_AFTER).
+            asyncio.create_task(self._reassert_loop())
 
             # Table subscriptions are active now, so asset rows appended by
             # protocol background work (e.g. network discovery) are picked up.

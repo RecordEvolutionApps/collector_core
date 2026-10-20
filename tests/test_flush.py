@@ -155,19 +155,49 @@ async def test_a_caller_cancelled_mid_write_loses_no_row():
     assert not c._buffer and not c._draining
 
 
-async def test_a_send_cancelled_mid_write_still_delivers_its_row():
+async def _settle(c):
+    """Wait for the background drains ``_send`` started."""
+    while c._draining:
+        await asyncio.gather(*c._draining)
+
+
+async def test_a_send_does_not_wait_for_a_held_write():
+    """The SDK holds a table write for up to its reconnect window (60 s)
+    while the link is down. _send must return at once all the same, or every
+    reading would stall its asset's collection loop for the whole window."""
     c = Collector(device_name="d", device_key=1, adapter=_Adapter())
     c.set_ironflock(GatedIF())
     c._buffer = deque([("measurements", {"asset_name": "B", "data": {}})])
-    task = asyncio.ensure_future(c._send("measurements", {"asset_name": "A", "data": {}}))
+    await asyncio.wait_for(c._send("measurements", {"asset_name": "A", "data": {}}), 0.1)
     await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    assert c.ironflock.calls == [] and c._draining  # the write waits; the send did not
     c.ironflock.gate.set()
-    for _ in range(100):
-        if c.ironflock.calls:
-            break
-        await asyncio.sleep(0.01)
+    await _settle(c)
     (call,) = c.ironflock.calls
     assert [row["asset_name"] for row in call[1]] == ["B", "A"]
+
+
+async def test_sends_during_a_held_write_queue_one_more_drain():
+    c = Collector(device_name="d", device_key=1, adapter=_Adapter())
+    c.set_ironflock(GatedIF())
+    await c._send("measurements", {"asset_name": "A", "n": 0})
+    await asyncio.sleep(0.01)                 # the first drain took row 0 and waits
+    for n in range(1, 50):
+        await c._send("measurements", {"asset_name": "A", "n": n})
+    assert len(c._draining) == 2              # the one running, one queued behind it
+    c.ironflock.gate.set()
+    await _settle(c)
+    assert [len(rows) for _, rows in c.ironflock.calls] == [1, 49]
+    assert [row["n"] for _, rows in c.ironflock.calls for row in rows] == list(range(50))
+    assert not c._buffer
+
+
+async def test_a_failed_background_write_keeps_the_rows_buffered():
+    c = Collector(device_name="d", device_key=1, adapter=_Adapter())
+    c.set_ironflock(FakeIF(fail_on="measurements"))
+    await c._send("measurements", {"asset_name": "A", "data": {}})
+    await _settle(c)
+    assert c._link_down and [row["asset_name"] for _, row in c._buffer] == ["A"]
+    c.ironflock.fail_on = None
+    await c._flush()                          # the flush loop's retry
+    assert not c._buffer and c.ironflock.calls == [("measurements", [{"asset_name": "A", "data": {}}])]

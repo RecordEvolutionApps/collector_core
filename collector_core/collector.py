@@ -259,6 +259,9 @@ class Collector:
         self._buffer = deque(maxlen=DEFAULT_BUFFER_SIZE)
         self._flush_lock = asyncio.Lock()
         self._draining = set()
+        # Whether a background flush is scheduled but has not taken the
+        # backlog yet (see _schedule_flush).
+        self._flush_queued = False
         # Cloud-link outage bookkeeping, used to inform the operator once on
         # recovery (never during the outage, when reporting can't get through):
         # whether the last flush attempt failed, and how many buffered rows the
@@ -765,10 +768,15 @@ class Collector:
 
         The single write path for the live data streams (measurements,
         assetstatus). Forward-only gateways (``store_data`` False) drop the
-        row. Otherwise the row is appended to the bounded buffer and an
-        opportunistic flush is attempted; a network failure leaves the row
-        (and any backlog) buffered for the next flush instead of raising, so
-        collection keeps running during a cloud outage.
+        row. Otherwise the row is appended to the bounded buffer and a flush
+        is started in the background (``_schedule_flush``); a network failure
+        leaves the row (and any backlog) buffered for the next flush instead
+        of raising, so collection keeps running during a cloud outage.
+
+        ``_send`` never waits for the write: the SDK (ironflock >= 1.9) holds
+        a table write for up to its ``reconnect_window`` (60 s) while the link
+        is down, and waiting for that here would stall the asset's collection
+        loop for the whole window on every reading.
 
         The row is made storable first (see ``collector_core.storable``). This
         is the one door into the shared buffer, and a row the platform cannot
@@ -783,20 +791,41 @@ class Collector:
         if self._buffer.maxlen is not None and len(self._buffer) >= self._buffer.maxlen:
             self._dropped_rows += 1  # deque drops the oldest row silently
         self._buffer.append((table, payload))
-        await self._flush()
+        self._schedule_flush()
+
+    def _schedule_flush(self):
+        """Start a background drain, unless one is already waiting its turn.
+
+        A drain takes the whole backlog when it gets the lock, so at most one
+        drain runs and one waits behind it for the rows appended meanwhile.
+        The task is held in ``_draining`` until it ends: nothing else
+        references it, and the loop keeps tasks only weakly. Being a task of
+        its own, it is not cancelled with the asset task that sent the row.
+        """
+        if self._flush_queued:
+            return
+        self._flush_queued = True
+        task = asyncio.ensure_future(self._background_drain())
+        self._draining.add(task)
+        task.add_done_callback(self._draining.discard)
+
+    async def _background_drain(self):
+        try:
+            await self._drain()
+        except Exception as e:
+            print(f"flush error: {e}")
 
     async def _flush(self):
         """Drain the buffer oldest-first while the link is up (``_drain``).
 
-        The drain runs shielded from whoever awaits it. That is usually an
-        asset's collection task, inside ``_send``, and an app cancels that
-        task whenever it reconfigures the asset (every row edit). Cancelled
-        mid-write, an unshielded drain would drop every row it had taken out
-        of the shared buffer - other assets' rows included - and putting them
-        back instead could write a chunk twice, since the write may already
-        have landed. Shielded, the drain finishes: each row is written once,
-        or re-queued by the failure path as usual. The caller still sees its
-        cancellation.
+        The drain runs shielded from whoever awaits it (``_flush_loop``; the
+        writes ``_send`` triggers run as tasks of their own, see
+        ``_schedule_flush``). Cancelled mid-write, an unshielded drain would
+        drop every row it had taken out of the shared buffer, and putting
+        them back instead could write a chunk twice, since the write may
+        already have landed. Shielded, the drain finishes: each row is
+        written once, or re-queued by the failure path as usual. The caller
+        still sees its cancellation.
         """
         drain = asyncio.ensure_future(self._drain())
         # Held until it ends: once its caller is gone, nothing else references
@@ -819,6 +848,8 @@ class Collector:
         (and ordering) is preserved.
         """
         async with self._flush_lock:
+            # Rows appended from here on need a drain of their own.
+            self._flush_queued = False
             pending = []
             for _ in range(len(self._buffer)):
                 if not self._buffer:

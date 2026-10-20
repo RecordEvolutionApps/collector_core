@@ -63,11 +63,18 @@ gateway/asset/datapoint columns the core reads:
 The core declares **zero dependencies** — the `ironflock` SDK handle is injected
 by the app — but it does call methods on that handle. If a release starts using
 a newer SDK method, record the new minimum here and in the release notes so apps
-bump their own `ironflock` pin. **Current minimum: `ironflock >= 1.4.1`** (the
-buffer flush uses `append_rows_to_table`). Apps that pass `ports=` to publish
-remote-access URLs (`gateways.url`) additionally need **`ironflock >= 1.5.3`**
-for `getRemoteAccessUrlForPort`'s `protocol` / `remote_port_environment`
-arguments; apps that declare no ports stay on the 1.4.1 floor.
+bump their own `ironflock` pin. **Current minimum: `ironflock >= 1.10.0`.**
+From 1.9.0 the SDK rides out a platform restart in its table writes: a write
+waits up to the SDK's `reconnect_window` (60 s) for the connection and is
+retried while the data backend is not serving yet, so a router or data-backend
+restart no longer counts as an outage here. 1.10.0 is the version the core is
+tested against. (The core still runs on `ironflock >= 1.4.1`, the first with
+`append_rows_to_table`, and `>= 1.5.3` for apps that pass `ports=`.)
+
+The SDK does not hold rows beyond that window: a write still failing after it
+raises, and a write in flight when the link drops fails at once. The core's own
+bounded buffer (`gateways.buffer_size`) therefore stays the store for longer
+outages, and the outage report on recovery comes from it.
 
 ### Steps
 

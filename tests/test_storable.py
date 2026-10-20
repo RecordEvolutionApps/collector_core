@@ -6,6 +6,7 @@ asset's writes. These tests drive the real Collector against a fake platform
 that refuses what msgpack/JSON cannot carry.
 """
 
+import asyncio
 import json
 import math
 from datetime import datetime, timezone
@@ -13,6 +14,12 @@ from datetime import datetime, timezone
 from collector_core.adapter import DatapointStore, ProtocolAdapter, emit_error
 from collector_core.collector import Collector
 from collector_core.storable import repair_text, storable
+
+
+async def _settle(c):
+    """Wait for the background drains ``_send`` started."""
+    while c._draining:
+        await asyncio.gather(*c._draining)
 
 
 class _Adapter(ProtocolAdapter):
@@ -140,6 +147,7 @@ async def test_a_poisoned_row_no_longer_blocks_other_assets():
     await c._publish_batch(bad, _datapoints("v"), {"v": "\ud800 boom"})
     await c._publish_batch(good, _datapoints("t"), {"t": 21.5})
     await c._publish_batch(bad, _datapoints("v"), {"v": float("nan")})
+    await _settle(c)
 
     assert not c._buffer and not c._link_down
     written = [row for table, rows in c.ironflock.calls for row in rows if table == "measurements"]
@@ -164,6 +172,7 @@ async def test_a_repair_is_reported_once_per_asset_and_kind():
 async def test_an_offline_detail_with_a_surrogate_is_stored():
     c = _collector()
     await c.set_asset_status({"asset_name": "A"}, "offline", "decode failed: \ud800")
+    await _settle(c)
     rows = [row for table, rows in c.ironflock.calls for row in rows if table == "assetstatus"]
     assert rows and rows[0]["detail"] == "decode failed: \\ud800"
 
@@ -171,6 +180,7 @@ async def test_an_offline_detail_with_a_surrogate_is_stored():
 async def test_publish_batch_does_not_print_every_row(capsys):
     c = _collector()
     await c._publish_batch({"asset_name": "A"}, _datapoints("v"), {"v": 1})
+    await _settle(c)
     # A healthy write path is silent: the device log is not a row log.
     assert capsys.readouterr().out == ""
     assert c.ironflock.calls

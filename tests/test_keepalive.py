@@ -6,12 +6,19 @@ table's dropAfter: the board lost the datapoint, and the user's per-datapoint
 pause / change-detection setting with it.
 """
 
+import asyncio
 import time
 from datetime import datetime, timedelta, timezone
 
 import collector_core.collector as core
 from collector_core.adapter import ProtocolAdapter
 from collector_core.collector import Collector
+
+
+async def _settle(c):
+    """Wait for the background drains ``_send`` started."""
+    while c._draining:
+        await asyncio.gather(*c._draining)
 
 
 class _Adapter(ProtocolAdapter):
@@ -88,6 +95,7 @@ async def test_a_rewritten_row_is_not_rewritten_again_on_the_next_pass():
 async def test_a_long_unchanged_status_is_rewritten(monkeypatch):
     c = _collector()
     await c.set_asset_status({"asset_name": "A"}, "online")
+    await _settle(c)
     c.ironflock.calls.clear()
     assert await c.reassert_stale_rows() == 0  # fresh
 
@@ -95,6 +103,7 @@ async def test_a_long_unchanged_status_is_rewritten(monkeypatch):
     when, status, detail = c._status_written["A"]
     c._status_written["A"] = (when - c.reassert_after - 1, status, detail)
     assert await c.reassert_stale_rows() == 1
+    await _settle(c)
     rows = [row for table, rows in c.ironflock.calls for row in rows if table == "assetstatus"]
     assert rows == [{"tsp": rows[0]["tsp"], "asset_name": "A", "gateway_id": 1,
                      "status": "online", "detail": "", "deleted": False}]

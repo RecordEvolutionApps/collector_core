@@ -97,12 +97,18 @@ Key semantics:
   reports go through the same repair, and `Collector.run` sets stdout/stderr
   to `backslashreplace`, so logging such text cannot end an asset's task. A
   healthy write path prints nothing.
-- **A cancelled caller never takes buffered rows with it.** The flush that
-  `_send` triggers runs inside an asset's collection task, which an app
-  cancels whenever it reconfigures that asset (every row edit). The drain
-  therefore runs shielded: the rows it took out of the shared buffer - every
-  asset's, not only the cancelled one's - are written once, or re-queued if
-  the write fails, whatever happens to the caller. (Up to v2.7.1 they were
+- **A send never waits for the platform.** `_send` puts the row into the
+  buffer and starts a drain as a task of its own; at most one drain runs and
+  one waits behind it for the rows appended meanwhile. The SDK
+  (ironflock >= 1.9) holds a table write for up to its `reconnect_window`
+  (60 s) while the link is down, and an asset's collection loop waiting for
+  that would take one reading a minute during an outage. (Up to v2.7.2 the
+  drain ran inline.)
+- **A cancelled caller never takes buffered rows with it.** The drain is not
+  part of the asset's collection task, which an app cancels whenever it
+  reconfigures that asset (every row edit), and the flush loop's drain runs
+  shielded: the rows a drain took out of the shared buffer - every asset's -
+  are written once, or re-queued if the write fails. (Up to v2.7.1 they were
   lost; putting them back instead could write a chunk twice.)
 - **Latest entity rows are kept alive.** Table retention (`dropAfter`) drops
   whole chunks, the latest row of an entity included, so a datapoint or an

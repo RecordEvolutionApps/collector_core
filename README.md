@@ -69,7 +69,11 @@ waits up to the SDK's `reconnect_window` (60 s) for the connection and is
 retried while the data backend is not serving yet, so a router or data-backend
 restart no longer counts as an outage here. 1.10.0 is the version the core is
 tested against. (The core still runs on `ironflock >= 1.4.1`, the first with
-`append_rows_to_table`, and `>= 1.5.3` for apps that pass `ports=`.)
+`append_rows_to_table`, and `>= 1.5.3` for apps that pass `ports=`.) Apps that
+pass `ports=` and run development installs need **`ironflock >= 1.11.1`**: the
+gateway `url` column's `cloud` URL comes straight from the SDK's
+`getRemoteAccessUrlForPort`, and only 1.11.1 gives a development run its own
+`-dev` tunnel URL.
 
 The SDK does not hold rows beyond that window: a write still failing after it
 raises, and a write in flight when the link drops fails at once. The core's own

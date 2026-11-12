@@ -258,16 +258,36 @@ collector = Collector(
 remote_port_environment?}`, the same shape as the template's `ports:` entries;
 pass a literal list instead of the helper if the app prefers not to depend on
 PyYAML. The resolved `url` column is a JSON object **keyed by the port number**
-(as a string) → `{name, protocol, main, url}`, so the frontend can index a port
-directly. `url` is a ready-to-use absolute URL (iframe `src`) for `http`/`https`
-ports, or null for a `tcp`/`udp` port whose tunnel is not yet up. For example, a
-`{port: 55000, name: "Config UI", main: true}` spec on device 42 resolves to:
+(as a string) → `{name, protocol, main, local?, cloud?}`, so the frontend can
+index a port directly. Each scope is a ready-to-use absolute URL (iframe `src`
+for `http`/`https` ports), and a consumer picks one explicitly:
+
+- `cloud: {url}` — the tunnel URL **exactly as the SDK's
+  `getRemoteAccessUrlForPort` returns it**. The core composes no tunnel URL of
+  its own: the label, the `secure-` prefix, a development run's `-dev` suffix,
+  an instance device's `i{INSTANCE_KEY}-` route, the domains and the announced
+  tcp/udp remote ports are the SDK's rules. Absent while the SDK knows no URL
+  (no identity yet, a tcp/udp tunnel not up yet).
+- `local: {ip, port, url}` — the LAN endpoint, from `DEVICE_LAN_IP` and
+  `DEVICE_PORT_FOR_<port>`.
+
+For example, a `{port: 55000, name: "Config UI", main: true}` spec on device 42
+resolves to:
 
 ```json
 { "55000": { "name": "Config UI", "protocol": "http", "main": true,
-             "url": "https://42-app-55000.app.ironflock.com" } }
+             "cloud": { "url": "https://42-app-55000.app.ironflock.com" } } }
 ```
 
+and, in a development run (`ENV` other than `PROD`), to the run's own tunnel
+`https://42-app-55000-dev.app.ironflock.com`.
+
 Resolution is best-effort and never blocks registration. Using this feature requires **`ironflock >= 1.5.3`** (the
-`protocol` / `remote_port_environment` arguments); apps that declare no ports
-are unaffected and keep the old minimum.
+`protocol` / `remote_port_environment` arguments), and **`>= 1.11.1`** for a
+development run's `-dev` URL (older SDKs return the PROD install's URL there);
+apps that declare no ports are unaffected and keep the old minimum.
+
+Between 2.7.0 and this change the core copied the SDK's tunnel rules to fill an
+extra `appliance` scope. The copy fell behind the SDK (no `-dev` suffix, so a
+dev run's board embedded the PROD install), and the SDK exposes no appliance
+route, so that scope is gone.

@@ -112,87 +112,6 @@ def _tolerate_unencodable_output(streams=None):
             pass  # not a TextIOWrapper (pytest capture, a pipe wrapper): leave it
 
 
-def _read_injected(name):
-    """Platform-injected value by name: the live env FILE first, env var second.
-
-    The device agent mirrors every injected env var to ``/data/env/{name}.txt``
-    (a bind mount it can update in RUNNING containers — e.g. the cloud port of
-    an instance tunnel, allocated only after the tunnel first connects). The
-    process env is the start-time snapshot and serves as the fallback. Same
-    contract as the ironflock SDK's ``_readInjectedValue``; directory
-    overridable via ``IRONFLOCK_ENV_DIR``.
-    """
-    env_dir = os.environ.get("IRONFLOCK_ENV_DIR", "/data/env")
-    try:
-        with open(os.path.join(env_dir, f"{name}.txt")) as f:
-            value = f.read().strip()
-        if value:
-            return value
-    except OSError:
-        pass
-    return os.environ.get(name)
-
-
-def _tunnel_access_urls(port, protocol, remote_port_environment):
-    """(appliance_url, cloud_url) for a declared port, mirroring the ironflock
-    SDK's ``getRemoteAccessUrlForPort`` label/domain rules — but returning BOTH
-    routes instead of the single preferred one.
-
-    ``cloud`` is the internet-facing URL: on instance (appliance-managed)
-    devices the ``i{INSTANCE_KEY}-``-prefixed route on ``CLOUD_TUNNEL_DOMAIN``;
-    on cloud-managed devices the plain route on ``TUNNEL_DOMAIN`` (which IS the
-    cloud edge there). ``appliance`` is the appliance-network URL — the plain
-    route on the appliance's ``TUNNEL_DOMAIN`` — and exists only on instance
-    devices (``INSTANCE_KEY`` set). Either value is None when the identity /
-    env it needs is unavailable or the tunnel label would be invalid.
-    """
-    instance_key = os.environ.get("INSTANCE_KEY")
-
-    if protocol in ("tcp", "udp"):
-        if not remote_port_environment:
-            return None, None
-        appliance = cloud = None
-        remote_port = _read_injected(remote_port_environment)
-        if remote_port:
-            tunnel_domain = os.environ.get("TUNNEL_DOMAIN", "app.ironflock.com")
-            url = f"{protocol}://{tunnel_domain}:{remote_port}"
-            if instance_key:
-                appliance = url
-            else:
-                cloud = url
-        if instance_key:
-            cloud_port = _read_injected(f"{remote_port_environment}_CLOUD")
-            if cloud_port:
-                cloud_domain = os.environ.get("CLOUD_TUNNEL_DOMAIN", "app.ironflock.com")
-                cloud = f"{protocol}://{cloud_domain}:{cloud_port}"
-        return appliance, cloud
-
-    if protocol not in ("http", "https"):
-        return None, None
-
-    device_key = os.environ.get("DEVICE_KEY")
-    app_name = os.environ.get("APP_NAME")
-    if not (device_key and app_name):
-        return None, None
-
-    label = f"{device_key}-{app_name.lower()}-{port}"
-    if protocol == "https":
-        # https-protocol tunnels get secure- prefixed subdomains platform-wide.
-        label = f"secure-{label}"
-
-    def _url(full_label, domain):
-        # A tunnel label must be a single valid DNS label (CloudURLFor).
-        if len(full_label) > 63 or "." in full_label:
-            return None
-        return f"https://{full_label}.{domain}"
-
-    tunnel_domain = os.environ.get("TUNNEL_DOMAIN", "app.ironflock.com")
-    if instance_key:
-        cloud_domain = os.environ.get("CLOUD_TUNNEL_DOMAIN", "app.ironflock.com")
-        return _url(label, tunnel_domain), _url(f"i{instance_key}-{label}", cloud_domain)
-    return None, _url(label, tunnel_domain)
-
-
 def outage_cause(exc):
     """Name the layer behind a failed platform write, for the outage log line.
 
@@ -225,7 +144,7 @@ class Collector:
         # .ironflock/port-template.yml (or any subset), each a dict with
         # ``port`` plus optional ``name``/``protocol``/``main``/
         # ``remote_port_environment``. Resolved to per-scope access URLs
-        # (local / appliance / cloud) and written to the gateway row's ``url``
+        # (local / cloud) and written to the gateway row's ``url``
         # column at registration so boards can list/embed a gateway's web UIs
         # (iframe src) — consumers pick a scope explicitly. Empty (the default)
         # leaves the ``url`` column untouched. Use
@@ -402,34 +321,33 @@ class Collector:
         """Resolve each declared port's access URLs for the gateway ``url`` column.
 
         Returns a dict **keyed by the port number** (as a string) mapping to
-        ``{name, protocol, main, local?, appliance?, cloud?}`` — one entry per
-        configured port — so the frontend can look a port up directly
-        (``url["55000"]``) instead of scanning a list.
+        ``{name, protocol, main, local?, cloud?}`` — one entry per configured
+        port — so the frontend can look a port up directly (``url["55000"]``)
+        instead of scanning a list.
 
         There is deliberately NO ambient/default URL field: a consumer must
-        choose the access scope explicitly. The three scopes are separate
-        keys, each ``{... , url}`` with a directly usable URL (iframe ``src``
-        for http/https ports):
+        choose the access scope explicitly. The scopes are separate keys, each
+        ``{... , url}`` with a directly usable URL (iframe ``src`` for
+        http/https ports):
 
         - ``local: {ip, port, url}`` — the LAN endpoint other devices on the
           same network reach directly (no tunnel). Present when the platform
           provides ``DEVICE_LAN_IP`` and ``DEVICE_PORT_FOR_<port>`` (the host
           port from the agent's managed pool).
-        - ``appliance: {url}`` — the appliance-network route on the operator's
-          appliance tunnel domain. Present only on instance devices
-          (``INSTANCE_KEY`` set).
-        - ``cloud: {url}`` — the internet-facing route: the cloud-forwarded
-          ``i{INSTANCE_KEY}-…`` URL on instance devices, the plain tunnel URL
-          on cloud-managed devices. Reachable once the port's tunnel is active.
+        - ``cloud: {url}`` — the tunnel URL, exactly as the ironflock SDK's
+          ``getRemoteAccessUrlForPort`` returns it (see ``_tunnel_url``).
+          Reachable once the port's tunnel is active.
 
         Best-effort: a port with no numeric ``port`` is skipped, and absent
         identity/env leaves the corresponding scope key out entirely (an entry
         can carry no scope at all, e.g. in local dev). If two specs declare
         the same port the last one wins.
 
-        Breaking change in 2.7.0: the legacy top-level ``url`` field (the
-        SDK-preferred route) is gone — bindings like ``url.55000.url`` must
-        become ``url.55000.cloud.url`` (or ``.appliance.url`` / ``.local.url``).
+        Breaking change in 2.7.0: the legacy top-level ``url`` field is gone —
+        bindings like ``url.55000.url`` must become ``url.55000.cloud.url``
+        (or ``.local.url``). The ``appliance`` scope that 2.7.0 added is gone
+        again: it came from a copy of the SDK's tunnel rules, and the SDK
+        exposes no appliance route.
         """
         urls = {}
         for spec in self.ports:
@@ -457,21 +375,40 @@ class Collector:
                     }
                 except ValueError:
                     print(f"ignoring non-numeric DEVICE_PORT_FOR_{port}={mapped!r}")
-            appliance_url, cloud_url = _tunnel_access_urls(
-                port, protocol, remote_port_environment
-            )
-            if appliance_url:
-                entry["appliance"] = {"url": appliance_url}
+            cloud_url = self._tunnel_url(port, protocol, remote_port_environment)
             if cloud_url:
                 entry["cloud"] = {"url": cloud_url}
             urls[str(port)] = entry
         return urls
 
+    def _tunnel_url(self, port, protocol, remote_port_environment):
+        """The tunnel URL of a declared port, from the SDK handle's
+        ``getRemoteAccessUrlForPort``, or None.
+
+        The SDK owns the platform's tunnel rules: the label, the ``secure-``
+        prefix of https ports, the ``-dev`` suffix of a development run
+        (``ENV`` other than PROD, SDK >= 1.11.1), the ``i{INSTANCE_KEY}-``
+        route of an instance device, the tunnel domains and the remote ports
+        the agent announces. The core used to copy those rules, and the copy
+        fell behind: dev runs got the PROD install's URL. So it asks the SDK
+        instead, the way every other IronFlock app does. A handle without the
+        method (SDK < 1.5.3) or a failing call gives None and leaves the scope
+        out.
+        """
+        get_url = getattr(self.ironflock, "getRemoteAccessUrlForPort", None)
+        if get_url is None:
+            return None
+        try:
+            return get_url(port, protocol, remote_port_environment) or None
+        except Exception as e:
+            print(f"remote-access URL for port {port} ({protocol}) unavailable: {e}")
+            return None
+
     async def register_gateway(self):
         """Write the registry row, echoing existing columns so user-edited
         gateway settings survive the startup append (the appended row becomes
         the latest one). When the app declared remote-access ports, their
-        resolved access scopes (local/appliance/cloud) are (re)written to the
+        resolved access scopes (local/cloud) are (re)written to the
         ``url`` column. App-provided ``gateway_extra`` columns are merged in
         before the core-owned fields, so the core always wins on those."""
         payload = {

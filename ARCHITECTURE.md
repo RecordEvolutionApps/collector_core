@@ -86,6 +86,19 @@ Key semantics:
   remain active.
 - **gateways rows are echo-merged**: the core re-appends the existing row's
   columns at startup so user-edited settings survive the registry write.
+- **The config tables are followed subscribe-first.** For `gateways`,
+  `datapoints` and `assets` the core subscribes, then reads the current rows
+  with the SDK's `{"latest": True}` marker (the physical `latest_flag` column no
+  longer exists), so a row saved during startup is not lost. Every row, read or
+  delivered, is applied only when its `tsp` is newer than the last row applied
+  for that entity (rows within 1 ms count as the same row: a read returns epoch
+  milliseconds, an event ISO text), so an older read never undoes a newer edit
+  and a deleted datapoint is never revived. `deleted` is null-safe like
+  `enabled`: only an explicit `true` deletes, so rows a board form wrote without
+  the flag are live. Rows of one asset are applied one at a time under a
+  per-asset lock, so a slow discovery for a stale row cannot override a later
+  edit. (Up to v2.9.0 the core read first, filtered on `latest_flag`, and
+  skipped rows whose `deleted` was NULL at startup.)
 - **Rows are made storable before they are buffered.** Measurements and
   assetstatus share one bounded buffer, and a row the platform cannot carry
   (a lone surrogate from a JSON escape, NaN/Infinity, an integer outside

@@ -63,6 +63,19 @@ REASSERT_INTERVAL = 6 * 3600
 # produces one toast an hour, not one per row.
 REPAIR_REPORT_INTERVAL = 3600
 
+# Following the config tables. The core subscribes first and reads the current
+# rows afterwards, so a row saved in between is not lost, and applies a row
+# only when its tsp is newer than the last one applied for that entity. A row
+# can arrive twice, from the read and from the subscription, with its tsp in
+# two forms (epoch milliseconds from the read, ISO text from the event); rows
+# within this many seconds of each other count as the same row.
+SAME_ROW_WINDOW = 0.001
+
+# The read filter for the current row of every entity (the data backend
+# derives it from the table's maintainLatestFlagFor columns). The former
+# physical latest_flag column no longer exists.
+LATEST = {"latest": True}
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -196,6 +209,12 @@ class Collector:
         # Overridable per instance (tests, apps with an unusually short
         # dropAfter); see REASSERT_AFTER.
         self.reassert_after = REASSERT_AFTER
+        # (table, entity key) -> tsp (epoch seconds) of the last config row
+        # applied, so an older or repeated row is not applied again.
+        self._applied_tsp: dict[tuple, float] = {}
+        # One lock per asset name: configuring an asset awaits discovery, and
+        # two rows of the same asset must not be applied out of order.
+        self._asset_locks: dict[str, asyncio.Lock] = {}
 
     def set_ironflock(self, ironflock):
         """Provide the IronFlock handle used for all table I/O. Must be called
@@ -249,6 +268,32 @@ class Collector:
             user_message=user_message or fallback_user_message,
         )
 
+    # ------------------------------------------------------------ config rows
+
+    def _is_newer(self, table, key, row):
+        """Whether ``row`` is newer, by its tsp, than the last row of this
+        entity applied from ``table``; records it when it is.
+
+        A row without a readable tsp is always applied (nothing to compare).
+        The same row delivered twice, by the startup read and by the
+        subscription, is applied once."""
+        when = _epoch_seconds(row.get("tsp"))
+        if when is None:
+            return True
+        last = self._applied_tsp.get((table, key))
+        if last is not None and when <= last + SAME_ROW_WINDOW:
+            return False
+        self._applied_tsp[(table, key)] = when
+        return True
+
+    def _is_own(self, row):
+        """Whether a row of assets or datapoints belongs to this gateway."""
+        gateway_id = row.get("gateway_id")
+        try:
+            return gateway_id is not None and int(gateway_id) == self.device_key
+        except (TypeError, ValueError):
+            return False
+
     # ----------------------------------------------------------------- gateway
 
     def _apply_gateway_row(self, row):
@@ -269,14 +314,29 @@ class Collector:
             # Resize, keeping the newest rows (deque drops the oldest overflow).
             self._buffer = deque(self._buffer, maxlen=size)
 
+    def _take_gateway_row(self, row):
+        """Make ``row`` this gateway's settings if it is this gateway's and
+        newer than the row in force. Returns whether it was taken."""
+        if row.get("gateway_name") != self.device_name:
+            return False
+        if not self._is_newer("gateways", self.device_name, row):
+            return False
+        self.gateway = row
+        self._apply_gateway_row(row)
+        return True
+
     async def load_gateway(self):
-        """Load this gateway's own row (registry + per-gateway settings)."""
+        """Load this gateway's own row (registry + per-gateway settings).
+
+        Call it after subscribing to ``gateways``: a row the subscription
+        already applied is newer than or the same as the one read here, and
+        the read does not replace it."""
         rows = await self.ironflock.getHistory(
             "gateways",
             {
-                "limit": 10,
+                "limit": 1,
                 "filterAnd": [
-                    {"column": "latest_flag", "operator": "=", "value": True},
+                    LATEST,
                     {
                         "column": "gateway_name",
                         "operator": "=",
@@ -285,8 +345,10 @@ class Collector:
                 ],
             },
         )
-        self.gateway = rows[0] if rows else {}
-        self._apply_gateway_row(self.gateway)
+        if rows:
+            self._take_gateway_row(rows[-1])
+        else:
+            self._apply_gateway_row(self.gateway)
         print(f"Gateway settings: {self.gateway}")
 
     @staticmethod
@@ -431,11 +493,9 @@ class Collector:
     def _handle_gateway_update(self):
         async def handler(*args, **kwargs):
             row = args[0] if args else {}
-            if row.get("gateway_name") != self.device_name:
+            if not self._take_gateway_row(row):
                 return
             print("Gateway settings updated:", row)
-            self.gateway = row
-            self._apply_gateway_row(row)
             try:
                 await self.adapter.apply_settings(row)
             except Exception as e:
@@ -496,8 +556,7 @@ class Collector:
         """Append a deleted record to soft-delete an invalid asset config.
 
         Echoes the original row's columns back with deleted=True and a fresh
-        tsp so the platform's latest_flag mechanism matches the existing row
-        by its key.
+        tsp, so it becomes the entity's current row (matched by its key).
         """
         payload = {
             k: v
@@ -535,20 +594,24 @@ class Collector:
         self.start_asset_task(asset)
 
     async def load_asset_configs(self):
-        """Load asset configurations from the assets table."""
+        """Follow the assets table: subscribe, then read the current rows and
+        configure this gateway's assets.
+
+        Subscribing first means no row saved during the read is lost; each row
+        goes through :meth:`_apply_asset_row`, which applies only rows newer
+        than the one in force. A row whose ``deleted`` is NULL is a live asset
+        (board forms and older rows leave the flag out)."""
+        configured_assets = []
+        await self.ironflock.subscribe_to_table(
+            "assets", self._handle_asset_update(configured_assets)
+        )
         # No gateway_id filter here: we need to see invalid/orphaned rows
         # (empty asset_name or null gateway_id) so we can clean them up.
         # Configuration is scoped to this device's gateway in the loop below.
-        result = await self.ironflock.getHistory(
-            "assets",
-            {
-                "limit": 1000,
-                "filterAnd": [
-                    {"column": "latest_flag", "operator": "=", "value": True},
-                    {"column": "deleted", "operator": "=", "value": False},
-                ],
-            },
+        rows = await self.ironflock.getHistory(
+            "assets", {"limit": 1000, "filterAnd": [LATEST]}
         )
+        result = [row for row in rows or [] if not row.get("deleted")]
         if not result:
             print(
                 "No assets found in the assets table. Please add asset configurations first."
@@ -560,7 +623,6 @@ class Collector:
             )
         print(f"Loaded {len(result)} asset(s) from assets table")
 
-        configured_assets = []
         for asset in result:
             asset_name = (asset.get("asset_name") or "").strip()
             gateway_id = asset.get("gateway_id")
@@ -584,79 +646,87 @@ class Collector:
                 continue
 
             # Only configure assets assigned to this device's gateway.
-            if int(gateway_id) != self.device_key:
-                continue
+            if self._is_own(asset):
+                await self._apply_asset_row(asset, configured_assets)
 
+        return configured_assets
+
+    def _asset_lock(self, asset_name):
+        lock = self._asset_locks.get(asset_name)
+        if lock is None:
+            lock = self._asset_locks[asset_name] = asyncio.Lock()
+        return lock
+
+    async def _apply_asset_row(self, asset, assets):
+        """Apply one of this gateway's asset rows if it is newer than the row
+        in force: configure the asset, or stop it when the row deletes it.
+
+        Rows of one asset are applied one at a time, in the order they win the
+        lock, and an older row that waited behind a newer one is dropped, so a
+        slow discovery for a stale row can never override a later edit.
+        Returns whether the row was applied; never raises."""
+        asset_name = asset.get("asset_name")
+        if not asset_name:
+            return False
+        async with self._asset_lock(asset_name):
+            if not self._is_newer("assets", asset_name, asset):
+                return False
+            if asset.get("deleted"):
+                assets[:] = [a for a in assets if a["asset_name"] != asset_name]
+                self.stop_asset_task(asset_name)
+                self._clear_datapoint_values(asset_name)
+                try:
+                    await self.clear_asset_status(asset)
+                except Exception as e:
+                    print(f"Failed to clear status of {asset_name}: {e}")
+                return True
             print(f"Configuring asset: {asset_name}")
             try:
-                await self.configure_asset(asset, configured_assets)
+                await self.configure_asset(asset, assets)
             except Exception as e:
-                print(f"Error configuring asset {asset_name}, skipping: {e}")
+                print(f"Error configuring asset {asset_name}: {e}")
+                traceback.print_exc()
                 await self.report_exception(
                     e,
                     asset_name=asset_name,
                     fallback_user_message=f"'{asset_name}' has an invalid configuration.",
                 )
-
-        await self.ironflock.subscribe_to_table(
-            "assets", self._handle_asset_update(configured_assets)
-        )
-        return configured_assets
+            return True
 
     def _handle_asset_update(self, assets):
         async def handler(*args, **kwargs):
             asset = args[0] if args else {}
-            gateway_id = asset.get("gateway_id")
-            if gateway_id is None or int(gateway_id) != self.device_key:
-                print(f"Received asset update for gateway_id {gateway_id}, ignoring")
+            if not self._is_own(asset):
+                print(f"Received asset update for gateway_id {asset.get('gateway_id')}, ignoring")
                 return
-            if asset.get("deleted"):
-                assets[:] = [
-                    a for a in assets if a["asset_name"] != asset["asset_name"]
-                ]
-                self.stop_asset_task(asset["asset_name"])
-                self._clear_datapoint_values(asset["asset_name"])
-                try:
-                    await self.clear_asset_status(asset)
-                except Exception as e:
-                    print(f"Failed to clear status of {asset['asset_name']}: {e}")
-            else:
-                try:
-                    await self.configure_asset(asset, assets)
-                except Exception as e:
-                    asset_name = asset.get("asset_name", "unknown")
-                    print(f"Error configuring asset {asset_name}: {e}")
-                    traceback.print_exc()
-                    await self.report_exception(
-                        e,
-                        asset_name=asset_name,
-                        fallback_user_message=f"'{asset_name}' has an invalid configuration.",
-                    )
+            await self._apply_asset_row(asset, assets)
 
         return handler
 
     async def load_datapoints(self):
-        """Load the datapoint catalog from the datapoints table."""
-        datapoints = await self.ironflock.getHistory(
+        """Follow the datapoints table: subscribe, then read this gateway's
+        current rows into the catalog.
+
+        The subscription, the returned list and the store share ONE list
+        object, so the live updates, the store and the collector's gating stay
+        in sync. Rows go through :meth:`_apply_datapoint_row` either way, which
+        applies only rows newer than the one in force."""
+        datapoints: list[dict] = []
+        await self.ironflock.subscribe_to_table(
+            "datapoints", self._handle_datapoint_update(datapoints)
+        )
+        rows = await self.ironflock.getHistory(
             "datapoints",
             {
                 "limit": 3000,
                 "filterAnd": [
-                    {"column": "latest_flag", "operator": "=", "value": True},
-                    {"column": "deleted", "operator": "=", "value": False},
+                    LATEST,
                     {"column": "gateway_id", "operator": "=", "value": self.device_key},
                 ],
             },
         )
-        # Subscribe to, return and store the SAME list object so the live
-        # subscription, the store and the collector's gating all stay in sync
-        # (a fresh [] here would diverge from the subscribed list on empty
-        # startup, hiding later catalog/edit updates until a restart).
-        if not datapoints:
-            datapoints = []
-        await self.ironflock.subscribe_to_table(
-            "datapoints", self._handle_datapoint_update(datapoints)
-        )
+        for row in rows or []:
+            self._apply_datapoint_row(datapoints, row)
 
         if datapoints:
             print(f"Loaded {len(datapoints)} datapoint(s) from datapoints table")
@@ -665,24 +735,32 @@ class Collector:
 
         return datapoints
 
+    def _apply_datapoint_row(self, datapoints, row):
+        """Put one of this gateway's datapoint rows into the catalog if it is
+        newer than the row in force; a deleted row (``deleted`` true) removes
+        the datapoint, a NULL flag keeps it. Returns whether it was applied."""
+        if not self._is_own(row):
+            return False
+        asset_name, datapoint_id = row.get("asset_name"), row.get("datapoint_id")
+        if not self._is_newer("datapoints", (asset_name, datapoint_id), row):
+            return False
+        datapoints[:] = [
+            dp
+            for dp in datapoints
+            if dp.get("datapoint_id") != datapoint_id or dp.get("asset_name") != asset_name
+        ]
+        if not row.get("deleted"):
+            datapoints.append(row)
+        return True
+
     def _handle_datapoint_update(self, datapoints):
         def handler(*args, **kwargs):
             row = args[0] if args else {}
-            gateway_id = row.get("gateway_id")
-            if gateway_id is None or int(gateway_id) != self.device_key:
-                print(f"Received datapoint update for gateway_id {gateway_id}, ignoring")
+            if not self._is_own(row):
+                print(f"Received datapoint update for gateway_id {row.get('gateway_id')}, ignoring")
                 return
-
-            datapoints[:] = [
-                dp
-                for dp in datapoints
-                if dp["datapoint_id"] != row["datapoint_id"]
-                or dp["asset_name"] != row["asset_name"]
-            ]
-            if not row["deleted"]:
-                datapoints.append(row)
-
-            print("Updated datapoints with row:", row)
+            if self._apply_datapoint_row(datapoints, row):
+                print("Updated datapoints with row:", row)
 
         return handler
 
@@ -1115,6 +1193,11 @@ class Collector:
     async def run(self):
         _tolerate_unencodable_output()
         try:
+            # Subscribe before reading, so a settings row saved during startup
+            # is not lost; the read then applies only what is newer.
+            await self.ironflock.subscribe_to_table(
+                "gateways", self._handle_gateway_update()
+            )
             await self.load_gateway()
             try:
                 await self.adapter.apply_settings(self.gateway)
@@ -1150,9 +1233,6 @@ class Collector:
                     fallback_user_message="Background device discovery failed to start.",
                 )
 
-            await self.ironflock.subscribe_to_table(
-                "gateways", self._handle_gateway_update()
-            )
             await self.register_gateway()
         except Exception as e:
             # Fatal startup failure (config load, subscription, registration):

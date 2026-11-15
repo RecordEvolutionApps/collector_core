@@ -24,7 +24,7 @@ pytest runs with `asyncio_mode = "auto"` — async test functions need no decora
 ## Hard constraints
 
 - **Zero runtime dependencies.** The core never imports the `ironflock` SDK; the app injects the handle via `collector.set_ironflock(ironflock)`. Don't add anything to `dependencies` in pyproject.toml. If a change starts calling a newer SDK method, bump the minimum `ironflock` version recorded in README.md (`refresh_transform` needs >= 1.11.0 and is looked up with `getattr`).
-- **One writer per table.** The core writes `gateways` (its own registration row only), `datapoints`, `measurements` and `assetstatus`; it never writes `gateway_settings`, `assets` or `datapoint_settings`, which the board and the AI assistant write. Nothing deletes a gateway or an asset row automatically.
+- **One writer per table.** The core writes `gateway_registry` (its own registration row only), `datapoints`, `measurements` and `assetstatus`; it never writes `gateway_settings`, `assets` or `datapoint_settings`, which the board and the AI assistant write. Nothing deletes a gateway or an asset row automatically.
 - **Python >= 3.10.**
 - **Semver is judged by the contract exposed to apps**: the adapter/session interface (`collector_core/adapter.py`), the `Collector` constructor and public methods, the table schema (`collector_core/data-template.yml`), and the columns the core reads. Breaking any of those is MAJOR. Git tag and `pyproject.toml` version must stay identical (the `just release` recipe enforces this).
 - After a release, each consuming app's `requirements.txt` must be re-pinned to the new tag — apps stay on their old tag until bumped.

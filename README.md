@@ -22,7 +22,7 @@ Seven tables, each with one writer (`gateway_id` is the gateway's
 
 | Table | Written by |
 |---|---|
-| `gateways` | the gateway about itself, at startup; the board writes only `{gateway_id, deleted: true}` |
+| `gateway_registry` | the gateway about itself, at startup; the board writes only `{gateway_id, deleted: true}` |
 | `gateway_settings` | the board (per-gateway settings: `store_data`, `buffer_size`, app columns) |
 | `assets` | the board's forms and the AI assistant (config_core) |
 | `datapoints` | the gateway (the catalog) |
@@ -50,7 +50,7 @@ collector = Collector(
     refresh_transforms={
         "assetstatus": ["asset_status_counts", "asset_overview"],
         "assets": ["asset_overview"],
-        "gateways": ["gateway_overview"],
+        "gateway_registry": ["gateway_overview"],
     },
 )
 ironflock = IronFlock(mainFunc=collector.run)
@@ -71,9 +71,12 @@ app:
 
 1. **Data template.** Take the seven tables from
    [collector_core/data-template.yml](collector_core/data-template.yml):
-   - `gateways`: identity `maintainLatestFlagFor: [gateway_id]`, add
-     `gateway_id` (numeric), drop `store_data`, `buffer_size` and any app
-     settings columns.
+   - add `gateway_registry` (identity `maintainLatestFlagFor:
+     [gateway_id]`), which replaces v2's `gateways`. IronFlock refuses to
+     change the entity key of an existing table, and v2's `gateways` is keyed
+     by `gateway_name`, so the registry is a new table. Keep v2's
+     `gateways` table in the template unchanged; the core no longer writes
+     it, and the board no longer reads it.
    - `assets`: remove `dropAfter` (nothing rewrites an unchanged asset, so
      its row must not age out).
    - add `gateway_settings` (`gateway_id`, `store_data`, `buffer_size`) and
@@ -86,10 +89,11 @@ app:
      `configured_by`), without `dropAfter`.
 2. **Board.** The gateway settings form writes `gateway_settings` with the
    gateway's `gateway_id`. The gateway delete form writes `{gateway_id,
-   deleted: true}` to `gateways`. The datapoint form writes
+   deleted: true}` to `gateway_registry`. The datapoint form writes
    `datapoint_settings` (`configured_by: "board"`); the AI assistant writes
-   the same table with `configured_by: "agent"`. Bindings that joined on
-   `gateways.gateway_name` join on `gateway_id`.
+   the same table with `configured_by: "agent"`. Bindings that read
+   `gateways` read `gateway_registry` and join on `gateway_id`, not
+   `gateway_name`.
 3. **Code.** Pass `refresh_transforms` for the transforms the board shows.
    `collector.gateway` is now `collector.settings` (the `gateway_settings`
    row); `apply_settings` receives that row. `Collector.soft_delete_asset`,

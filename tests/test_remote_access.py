@@ -131,7 +131,7 @@ async def test_register_gateway_writes_url_column(monkeypatch):
     c = _collector(ports, fake)
     await c.register_gateway()
     (table, payload) = fake.appended[-1]
-    assert table == "gateways"
+    assert table == "gateway_registry"
     assert payload["gateway_name"] == "dev"
     assert payload["url"] == {
         "51821": {
@@ -174,7 +174,7 @@ async def test_the_registration_row_is_keyed_by_the_device_key():
     c.set_ironflock(fake)
     await c.register_gateway()
     (table, payload) = fake.appended[-1]
-    assert table == "gateways"
+    assert table == "gateway_registry"
     assert set(payload) == {"tsp", "gateway_id", "gateway_name", "info", "url", "deleted"}
     assert payload["gateway_id"] == 42
     assert payload["gateway_name"] == "dev"

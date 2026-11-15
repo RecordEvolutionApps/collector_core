@@ -86,7 +86,7 @@ class OldIF(FakeIF):
 MAPPING = {
     "assetstatus": ["asset_status_counts", "asset_overview"],
     "assets": ["asset_overview"],
-    "gateways": ["gateway_overview"],
+    "gateway_registry": ["gateway_overview"],
     "gateway_settings": ["gateway_overview"],
     "datapoints": ["datapoint_overview"],
     "datapoint_settings": ["datapoint_overview"],

@@ -170,7 +170,7 @@ async def test_the_core_follows_neither_gateways_nor_datapoints():
     await c.load_datapoint_settings()
     await c.load_asset_configs()
     touched = {table for _, table in fake.log}
-    assert "gateways" not in touched
+    assert "gateway_registry" not in touched
     assert ("subscribe", "datapoints") not in fake.log
 
 

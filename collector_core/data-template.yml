@@ -14,7 +14,7 @@
 # - Every table has exactly one writer, named in its description. The gateway
 #   writes what it measures and registers; the board (and the AI assistant)
 #   writes what users decide. The only exception is the delete row the board
-#   writes to `gateways`.
+#   writes to `gateway_registry`.
 # - `tsp` is mandatory on every table (platform requirement).
 # - Identity keys (maintainLatestFlagFor) must match exactly: rows are
 #   semantically updated by appending with the same key columns.
@@ -27,7 +27,7 @@ data:
   tables:
     # The edge PCs (gateways) this app runs on. Each gateway registers itself
     # at startup; nothing deletes a row automatically.
-    - tablename: gateways
+    - tablename: gateway_registry
       description: >-
         The gateways (edge PCs) this app runs on. Written by the gateway about itself: each gateway writes its
         row at startup with deleted false. The board writes only delete rows, {gateway_id, deleted: true}.
@@ -83,7 +83,7 @@ data:
           dataType: timestamp
         - id: gateway_id
           name: Gateway ID
-          description: The gateway the settings apply to; joins on gateway_id in the gateways table.
+          description: The gateway the settings apply to; joins on gateway_id in the gateway_registry table.
           dataType: numeric
         - id: store_data
           name: Store Data
@@ -117,7 +117,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: The gateway that collects the asset; joins on gateway_id in the gateways table.
+          description: The gateway that collects the asset; joins on gateway_id in the gateway_registry table.
           dataType: numeric
         - id: datapoint_spec
           name: Datapoint Spec
@@ -172,7 +172,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: The gateway that collects the datapoint; joins on gateway_id in the gateways table.
+          description: The gateway that collects the datapoint; joins on gateway_id in the gateway_registry table.
           dataType: numeric
         - id: name
           name: Name
@@ -218,7 +218,7 @@ data:
           dataType: timestamp
         - id: gateway_id
           name: Gateway ID
-          description: The gateway that collects the datapoint; joins on gateway_id in the gateways table.
+          description: The gateway that collects the datapoint; joins on gateway_id in the gateway_registry table.
           dataType: numeric
         - id: asset_name
           name: Asset Name
@@ -277,7 +277,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: The gateway that collects the asset; joins on gateway_id in the gateways table.
+          description: The gateway that collects the asset; joins on gateway_id in the gateway_registry table.
           dataType: numeric
         - id: data
           name: Data
@@ -303,7 +303,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: The gateway that collects the asset; joins on gateway_id in the gateways table.
+          description: The gateway that collects the asset; joins on gateway_id in the gateway_registry table.
           dataType: numeric
         - id: status
           name: Status

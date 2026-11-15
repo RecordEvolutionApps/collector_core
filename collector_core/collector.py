@@ -595,7 +595,7 @@ class Collector:
             return None
 
     async def register_gateway(self):
-        """Write this gateway's row of ``gateways``: the gateway registers
+        """Write this gateway's row of ``gateway_registry``: the gateway registers
         itself, keyed by ``gateway_id`` (its DEVICE_KEY).
 
         The row is ``{tsp, gateway_id, gateway_name, info, url, deleted:
@@ -618,8 +618,8 @@ class Collector:
         payload["url"] = self._resolve_remote_access_urls() if self.ports else None
         payload["deleted"] = False
         payload["tsp"] = _now()
-        await self.ironflock.append_to_table("gateways", payload)
-        self.request_refresh("gateways")
+        await self.ironflock.append_to_table("gateway_registry", payload)
+        self.request_refresh("gateway_registry")
 
     # ------------------------------------------------------------------ status
 

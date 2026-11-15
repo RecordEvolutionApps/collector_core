@@ -36,7 +36,7 @@ users decide. `gateway_id` is the gateway's `DEVICE_KEY` in every table.
 
 | Table | Writer | Identity (latest-flag) | Core columns |
 |---|---|---|---|
-| `gateways` | the gateway, about itself (the board writes only delete rows) | gateway_id | tsp, gateway_id, gateway_name, info (json), url (json), deleted |
+| `gateway_registry` | the gateway, about itself (the board writes only delete rows) | gateway_id | tsp, gateway_id, gateway_name, info (json), url (json), deleted |
 | `gateway_settings` | the board | gateway_id | tsp, gateway_id, store_data, buffer_size |
 | `assets` | the board's forms and the AI assistant | gateway_id, asset_name | tsp, asset_name, gateway_id, datapoint_spec, collect_interval, enabled, demo_mode, deleted |
 | `datapoints` | the gateway (the catalog) | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, demo_value, demo_variance, deleted |
@@ -48,7 +48,7 @@ Apps add their own columns: connection parameters on `assets`, protocol
 metadata on `datapoints`, their own per-gateway settings on `gateway_settings`
 (e.g. `iodd_autofetch`).
 
-### gateways
+### gateway_registry
 
 The gateway registers itself first thing at startup, before its assets are
 configured, with one row:
@@ -56,14 +56,14 @@ configured, with one row:
 `gateway_extra` columns (the core-owned columns win). `gateway_id` is the
 identity; `gateway_name` is the device's `DEVICE_NAME` as a plain value, so a
 renamed device stays the same gateway. `url` holds the URLs of the app's
-remote-access ports (see [below](#remote-access-urls-gatewaysurl)), and is
+remote-access ports (see [below](#remote-access-urls-gateway_registryurl)), and is
 written as null when the app declares none, so the URLs of an earlier start
 do not carry over. Nothing of an earlier row is echoed.
 
 A user deletes a gateway on the board with a row `{gateway_id, deleted:
 true}`. Nothing deletes a gateway automatically, and a deleted gateway that
 starts again writes `deleted: false` and reappears. The core neither reads
-nor follows `gateways`.
+nor follows `gateway_registry`.
 
 ### gateway_settings
 
@@ -213,7 +213,7 @@ the transforms mapped to that table (see
   rows it owns that are older than `Collector.reassert_after` (default 7
   days). Keep every app's `dropAfter` for those tables far above that. The
   board-written tables are not rewritten, so `assets`, `gateway_settings`
-  and `datapoint_settings` have no `dropAfter`, and neither has `gateways`.
+  and `datapoint_settings` have no `dropAfter`, and neither has `gateway_registry`.
 - **Secrets never go into tables** (boards can read them). Credentials and
   certificates come from device environment or mounted volumes; tables hold
   only non-secret configuration.
@@ -325,7 +325,7 @@ collector.set_ironflock(ironflock)
 ironflock.run()
 ```
 
-## Remote-access URLs (gateways.url)
+## Remote-access URLs (gateway_registry.url)
 
 To surface a gateway's own web UIs (a config UI, a live viewer) for embedding
 on a board, the app passes the ports it declares in its
@@ -392,7 +392,7 @@ collector = Collector(
     refresh_transforms={
         "assetstatus": ["asset_status_counts", "asset_overview"],
         "assets": ["asset_overview"],
-        "gateways": ["gateway_overview"],
+        "gateway_registry": ["gateway_overview"],
     },
 )
 ```

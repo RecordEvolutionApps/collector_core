@@ -74,6 +74,8 @@ app:
    - `gateways`: identity `maintainLatestFlagFor: [gateway_id]`, add
      `gateway_id` (numeric), drop `store_data`, `buffer_size` and any app
      settings columns.
+   - `assets`: remove `dropAfter` (nothing rewrites an unchanged asset, so
+     its row must not age out).
    - add `gateway_settings` (`gateway_id`, `store_data`, `buffer_size`) and
      move the app's own per-gateway settings columns there (e.g.
      `iodd_autofetch`).

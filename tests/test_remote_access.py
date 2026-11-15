@@ -143,13 +143,15 @@ async def test_register_gateway_writes_url_column(monkeypatch):
     }
 
 
-async def test_register_gateway_omits_url_when_no_ports():
+async def test_register_gateway_clears_url_when_no_ports():
     fake = FakeIF()
     c = Collector(device_name="dev", device_key=42, adapter=_Adapter())
     c.set_ironflock(fake)
     await c.register_gateway()
     (_, payload) = fake.appended[-1]
-    assert "url" not in payload  # inert for apps that declare no ports
+    # None, not absent: a column the row leaves out keeps the URLs of an
+    # earlier start that still declared ports.
+    assert payload["url"] is None
 
 
 async def test_register_gateway_computes_url_from_the_environment(monkeypatch):
@@ -173,7 +175,7 @@ async def test_the_registration_row_is_keyed_by_the_device_key():
     await c.register_gateway()
     (table, payload) = fake.appended[-1]
     assert table == "gateways"
-    assert set(payload) == {"tsp", "gateway_id", "gateway_name", "info", "deleted"}
+    assert set(payload) == {"tsp", "gateway_id", "gateway_name", "info", "url", "deleted"}
     assert payload["gateway_id"] == 42
     assert payload["gateway_name"] == "dev"
     assert payload["deleted"] is False
@@ -295,7 +297,7 @@ async def test_gateway_extra_never_overrides_core_columns():
     assert payload["gateway_name"] == "dev"
     assert payload["gateway_id"] == 42
     assert payload["deleted"] is False
-    assert isinstance(payload["info"], dict) and "url" not in payload
+    assert isinstance(payload["info"], dict) and payload["url"] is None
     assert payload["qds_role"] == "backend"
 
 

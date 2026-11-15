@@ -87,6 +87,15 @@ REFRESH_MIN_INTERVAL = 2.0
 REFRESH_RETRY_DELAY = 2.0
 REFRESH_IN_PROGRESS = "URI_REFRESH_IN_PROGRESS"
 
+# The most rows one read returns (the SDK's getHistory limit for a table).
+# The core reads at most this many of a gateway's assets, catalog rows and
+# datapoint settings at startup, and says so when it hits the limit.
+READ_LIMIT = 10000
+
+# How long a restarted asset task waits for the task it replaces to close its
+# session (seconds).
+TASK_STOP_TIMEOUT = 10
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -116,6 +125,15 @@ def _epoch_seconds(value):
     except ValueError:
         return None
     return _epoch_seconds(moment)
+
+
+def _collect_interval(asset):
+    """The asset's ``collect_interval`` in whole seconds, at least 1. A
+    missing or unreadable value means 1."""
+    try:
+        return max(int(float(asset.get("collect_interval") or 1)), 1)
+    except (TypeError, ValueError, OverflowError):
+        return 1
 
 
 def _tolerate_unencodable_output(streams=None):
@@ -221,7 +239,7 @@ class Collector:
         # {table: [transform, ...]}, each list in bottom-up order (a transform
         # before the ones that read it). Needs ironflock >= 1.11.0 for
         # refresh_transform; see request_refresh.
-        self.refresh_transforms = _transform_lists(refresh_transforms)
+        self.refresh_transforms = refresh_transforms
         # Default when the gateway_settings row has no store_data value. With
         # store_data False, configuration is still read live from the
         # platform but collected data is not written to it.
@@ -284,6 +302,18 @@ class Collector:
         self._table_refresh_pending: set = set()
         self._refreshing: set = set()
         self._refresh_unsupported_reported = False
+        # Background loops started by run(), held until they end.
+        self._background: set = set()
+
+    @property
+    def refresh_transforms(self):
+        """{table: [transform, ...]}, see the constructor. Assigning normalizes
+        it the same way, so a single name may be given as a string."""
+        return self._refresh_transforms
+
+    @refresh_transforms.setter
+    def refresh_transforms(self, mapping):
+        self._refresh_transforms = _transform_lists(mapping)
 
     def set_ironflock(self, ironflock):
         """Provide the IronFlock handle used for all table I/O. Must be called
@@ -569,7 +599,7 @@ class Collector:
         itself, keyed by ``gateway_id`` (its DEVICE_KEY).
 
         The row is ``{tsp, gateway_id, gateway_name, info, url, deleted:
-        False}``, ``url`` only when the app declared remote-access ports
+        False}``, ``url`` None when the app declares no remote-access ports
         (recomputed from the live tunnel/identity on every start). App-provided
         ``gateway_extra`` columns are merged in first, so the core-owned
         columns win. ``deleted: False`` brings back a gateway a user deleted
@@ -583,10 +613,9 @@ class Collector:
             "app_started": _now(),
             "python": sys.version.split()[0],
         }
-        if self.ports:
-            payload["url"] = self._resolve_remote_access_urls()
-        else:
-            payload.pop("url", None)
+        # A column the row leaves out keeps its value, so an app that no longer
+        # declares ports clears the URLs of an earlier start.
+        payload["url"] = self._resolve_remote_access_urls() if self.ports else None
         payload["deleted"] = False
         payload["tsp"] = _now()
         await self.ironflock.append_to_table("gateways", payload)
@@ -643,8 +672,14 @@ class Collector:
         return asset.get("enabled") is not False
 
     async def configure_asset(self, asset, assets):
-        """(Re)configure one asset row: resolve datapoints, start or stop its
-        collection task according to ``enabled``."""
+        """(Re)configure one asset row: start or stop its collection task
+        according to ``enabled``.
+
+        The datapoints are resolved by the task (``_datapoints_provider``), not
+        here: a discovery that fails (a device unreachable at startup, an
+        invalid spec) is then retried every interval and marks the asset
+        offline like any other failure, and a slow discovery does not hold up
+        the other assets or the startup."""
         assets[:] = [a for a in assets if a["asset_name"] != asset["asset_name"]]
         assets.append(asset)
 
@@ -654,11 +689,7 @@ class Collector:
             await self.set_asset_status(asset, "paused")
             return
 
-        if not self.adapter.resolve_each_cycle:
-            asset["datapoint_list"] = await self.adapter.prepare_datapoints(
-                asset, self.store
-            )
-            print("datapoint_list", asset["datapoint_list"])
+        asset.pop("datapoint_list", None)
         self.start_asset_task(asset)
 
     async def load_asset_configs(self):
@@ -679,12 +710,9 @@ class Collector:
         await self.ironflock.subscribe_to_table(
             "assets", self._handle_asset_update(configured_assets)
         )
-        # No gateway_id filter: rows without a gateway are reported too.
-        # Configuration is scoped to this gateway in the loop below.
-        rows = await self.ironflock.getHistory(
-            "assets", {"limit": 1000, "filterAnd": [LATEST]}
-        )
-        live = [row for row in rows or [] if not row.get("deleted")]
+        rows = await self._read_own("assets")
+        rows += await self._read_without_gateway("assets")
+        live = [row for row in rows if not row.get("deleted")]
         own = [row for row in live if self._is_own(row)]
         if not own:
             print(
@@ -703,12 +731,56 @@ class Collector:
             if self._is_own(asset):
                 await self._apply_asset_row(asset, configured_assets)
 
-        for asset in rows or []:
+        for asset in rows:
             name = (asset.get("asset_name") or "").strip()
-            if asset.get("deleted") and name and self._is_own(asset):
-                await self._delete_catalog(name)
+            if not (asset.get("deleted") and name and self._is_own(asset)):
+                continue
+            # Under the asset's lock and only when newer: a row the
+            # subscription applied meanwhile (the asset created again) wins.
+            async with self._asset_lock(name):
+                if self._is_newer("assets", name, asset):
+                    await self._delete_catalog(name)
 
         return configured_assets
+
+    async def _read_own(self, table):
+        """The current rows of this gateway in ``table`` (latest marker and a
+        gateway_id filter), at most READ_LIMIT; hitting the limit is
+        printed, since the rows beyond it are not read."""
+        rows = await self.ironflock.getHistory(
+            table,
+            {
+                "limit": READ_LIMIT,
+                "filterAnd": [
+                    LATEST,
+                    {"column": "gateway_id", "operator": "=", "value": self.device_key},
+                ],
+            },
+        )
+        rows = list(rows or [])
+        if len(rows) >= READ_LIMIT:
+            print(f"read {len(rows)} rows of {table}, the most one read returns; the rest are not loaded")
+        return rows
+
+    async def _read_without_gateway(self, table):
+        """The current rows of ``table`` without a gateway_id, so incomplete
+        asset rows are reported at startup. Best effort: a data backend that
+        refuses the read gives []."""
+        try:
+            rows = await self.ironflock.getHistory(
+                table,
+                {
+                    "limit": 100,
+                    "filterAnd": [
+                        LATEST,
+                        {"column": "gateway_id", "operator": "IS NULL"},
+                    ],
+                },
+            )
+        except Exception as e:
+            print(f"could not read the {table} rows without a gateway: {e}")
+            return []
+        return [row for row in rows or [] if row.get("gateway_id") is None]
 
     async def _skip_incomplete_asset(self, asset):
         """Whether ``asset`` is an incomplete row to skip: no ``gateway_id``,
@@ -750,7 +822,7 @@ class Collector:
 
         Rows of one asset are applied one at a time, in the order they win the
         lock, and an older row that waited behind a newer one is dropped, so a
-        slow discovery for a stale row can never override a later edit.
+        stale row can never override a later edit.
         A deleting row also soft-deletes the asset's catalog rows and its
         status. An applied row requests a refresh of the transforms over
         ``assets``. Returns whether the row was applied; never raises."""
@@ -814,17 +886,7 @@ class Collector:
         startup and not followed: the store keeps the returned list current
         as it writes. The returned list object is shared with the store."""
         datapoints: list[dict] = []
-        rows = await self.ironflock.getHistory(
-            "datapoints",
-            {
-                "limit": 3000,
-                "filterAnd": [
-                    LATEST,
-                    {"column": "gateway_id", "operator": "=", "value": self.device_key},
-                ],
-            },
-        )
-        for row in rows or []:
+        for row in await self._read_own("datapoints"):
             self._apply_datapoint_row(datapoints, row)
 
         if datapoints:
@@ -865,17 +927,7 @@ class Collector:
         await self.ironflock.subscribe_to_table(
             "datapoint_settings", self._handle_datapoint_settings_update()
         )
-        rows = await self.ironflock.getHistory(
-            "datapoint_settings",
-            {
-                "limit": 3000,
-                "filterAnd": [
-                    LATEST,
-                    {"column": "gateway_id", "operator": "=", "value": self.device_key},
-                ],
-            },
-        )
-        for row in rows or []:
+        for row in await self._read_own("datapoint_settings"):
             self._apply_datapoint_settings_row(row)
         print(f"Loaded {len(self.datapoint_settings)} datapoint setting(s)")
         return self.datapoint_settings
@@ -908,14 +960,26 @@ class Collector:
     # -------------------------------------------------------------- task mgmt
 
     def stop_asset_task(self, asset_name):
+        """Cancel the asset's task; returns it (or None) so a caller can wait
+        for its session to close."""
         task = self.asset_tasks.pop(asset_name, None)
         if task is not None:
             task.cancel()
+        return task
 
     def start_asset_task(self, asset):
+        """(Re)start the asset's collection task. The new task first waits
+        (up to TASK_STOP_TIMEOUT) for the one it replaces to close its
+        session, so a device that takes one connection is never opened
+        twice."""
         name = asset["asset_name"]
-        self.stop_asset_task(name)
-        self.asset_tasks[name] = asyncio.create_task(self.collect_asset(asset))
+        previous = self.stop_asset_task(name)
+        self.asset_tasks[name] = asyncio.create_task(self._collect_after(previous, asset))
+
+    async def _collect_after(self, previous, asset):
+        if previous is not None and not previous.done():
+            await asyncio.wait({previous}, timeout=TASK_STOP_TIMEOUT)
+        await self.collect_asset(asset)
 
     # ---------------------------------------------------------- outbound writes
 
@@ -1024,8 +1088,15 @@ class Collector:
                 try:
                     await self.ironflock.append_rows_to_table(table, rows)
                 except Exception as e:
-                    # Still down: re-queue everything not yet sent, in order.
-                    self._buffer.extendleft(reversed(pending[i:]))
+                    # Still down: re-queue everything not yet sent, in order,
+                    # ahead of the rows appended meanwhile. A full buffer drops
+                    # the oldest rows, as _send does (extendleft would drop the
+                    # newest).
+                    rows_left = pending[i:] + list(self._buffer)
+                    size = self._buffer.maxlen
+                    if size is not None and len(rows_left) > size:
+                        self._dropped_rows += len(rows_left) - size
+                    self._buffer = deque(rows_left, maxlen=size)
                     self._link_down = True
                     print(f"buffered {len(self._buffer)} row(s); {outage_cause(e)}: {e}")
                     return
@@ -1279,8 +1350,9 @@ class Collector:
     def _datapoints_provider(self, asset):
         """Async callable handed to the session's stream: returns the current
         datapoint list, re-resolving per cycle for resolve_each_cycle
-        adapters and lazily re-running prepare_datapoints for cached adapters
-        whenever the cache was invalidated (DatapointsChanged)."""
+        adapters, and for cached adapters running prepare_datapoints while
+        no list is cached: at the task's start, after a failed discovery and
+        after DatapointsChanged."""
 
         async def provider():
             if self.adapter.resolve_each_cycle:
@@ -1289,7 +1361,7 @@ class Collector:
             if datapoints is None:
                 datapoints = await self.adapter.prepare_datapoints(asset, self.store)
                 asset["datapoint_list"] = datapoints
-                print("datapoint_list (re-resolved)", datapoints)
+                print("datapoint_list", datapoints)
             return datapoints
 
         return provider
@@ -1399,12 +1471,13 @@ class Collector:
         DatapointsChanged invalidates the cached datapoint list and restarts
         without backoff."""
         asset_name = asset["asset_name"]
-        interval = max(int(asset.get("collect_interval") or 1), 1)
+        interval = _collect_interval(asset)
         provider = self._datapoints_provider(asset)
         while True:
             backoff = interval
-            session = self.adapter.create_session(asset)
+            session = None
             try:
+                session = self.adapter.create_session(asset)
                 if asset.get("demo_mode"):
                     # Core-paced demo loop: works for push protocols too,
                     # since no server-side subscription exists in demo mode.
@@ -1445,7 +1518,13 @@ class Collector:
                 except Exception as status_error:
                     print(f"Failed to record offline status: {status_error}")
             finally:
-                await session.close()
+                if session is not None:
+                    try:
+                        await session.close()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        print(f"collect_asset {asset_name}: closing the session failed: {e}")
             await asyncio.sleep(backoff)
 
     # ------------------------------------------------------------------- run
@@ -1453,6 +1532,9 @@ class Collector:
     async def run(self):
         _tolerate_unencodable_output()
         try:
+            # The gateway shows up on the board first, whatever the assets do.
+            await self.register_gateway()
+
             # Each followed table is subscribed before it is read, so a row
             # saved during startup is not lost; the read then applies only
             # what is newer.
@@ -1470,11 +1552,14 @@ class Collector:
             await self.load_datapoint_settings()
             await self.load_asset_configs()
 
-            # Drains the offline buffer on reconnect even when no new data flows.
-            asyncio.create_task(self._flush_loop())
-            # Rewrites long-unchanged catalog and status rows before table
-            # retention can drop them (see REASSERT_AFTER).
-            asyncio.create_task(self._reassert_loop())
+            # Drains the offline buffer on reconnect even when no new data
+            # flows, and rewrites long-unchanged catalog and status rows
+            # before table retention can drop them (see REASSERT_AFTER). Held
+            # in _background: the loop keeps tasks only weakly.
+            for loop in (self._flush_loop(), self._reassert_loop()):
+                task = asyncio.create_task(loop)
+                self._background.add(task)
+                task.add_done_callback(self._background.discard)
 
             # Table subscriptions are active now, so asset rows appended by
             # protocol background work (e.g. network discovery) are picked up.
@@ -1487,8 +1572,6 @@ class Collector:
                     e,
                     fallback_user_message="Background device discovery failed to start.",
                 )
-
-            await self.register_gateway()
         except Exception as e:
             # Fatal startup failure (config load, subscription, registration):
             # surface it to the operator, then re-raise so the runtime sees the

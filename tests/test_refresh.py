@@ -356,3 +356,9 @@ async def test_an_adapter_can_request_a_refresh_of_its_own_table():
     c.request_refresh("iodds")
     await _settle(c)
     assert c.ironflock.names() == ["iodd_overview"]
+
+
+def test_assigning_refresh_transforms_normalizes_it_too():
+    c = Collector(device_name="d", device_key=1, adapter=_Adapter())
+    c.refresh_transforms = {"assetstatus": "asset_status_counts"}
+    assert c.refresh_transforms == {"assetstatus": ["asset_status_counts"]}

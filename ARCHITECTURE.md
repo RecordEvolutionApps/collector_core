@@ -50,13 +50,15 @@ metadata on `datapoints`, their own per-gateway settings on `gateway_settings`
 
 ### gateways
 
-The gateway registers itself at startup with one row:
+The gateway registers itself first thing at startup, before its assets are
+configured, with one row:
 `{tsp, gateway_id, gateway_name, info, url, deleted: false}` plus the app's
 `gateway_extra` columns (the core-owned columns win). `gateway_id` is the
 identity; `gateway_name` is the device's `DEVICE_NAME` as a plain value, so a
-renamed device stays the same gateway. `url` is written only when the app
-declares remote-access ports (see [below](#remote-access-urls-gatewaysurl)).
-Nothing of an earlier row is echoed.
+renamed device stays the same gateway. `url` holds the URLs of the app's
+remote-access ports (see [below](#remote-access-urls-gatewaysurl)), and is
+written as null when the app declares none, so the URLs of an earlier start
+do not carry over. Nothing of an earlier row is echoed.
 
 A user deletes a gateway on the board with a row `{gateway_id, deleted:
 true}`. Nothing deletes a gateway automatically, and a deleted gateway that
@@ -107,8 +109,10 @@ Written by the board's forms and the AI assistant; the core only reads it.
 The catalog of value streams per asset, written only by the gateway through
 `DatapointStore` (discovery, the datapoint spec, soft-deletes of datapoints
 that are gone). It holds what the device and the adapter know and no user
-settings: `upsert` writes the adapter's payload as given, nothing of the
-previous row is carried over. `demo_value` / `demo_variance` are optional
+settings: `upsert` writes the adapter's payload as given plus `deleted:
+false` (a column a row leaves out keeps its value, so a datapoint that comes
+back after a soft-delete would otherwise stay deleted), and nothing else of
+the previous row is carried over. `demo_value` / `demo_variance` are optional
 defaults an adapter derives from its spec. The core reads this gateway's
 catalog once at startup; the store keeps the in-memory list current as it
 writes, so the table is not followed.
@@ -161,16 +165,20 @@ publish), `offline` (collection error, with error text in `detail`), `paused`
 
 `gateway_settings`, `assets` and `datapoint_settings` are followed
 subscribe-first: the core subscribes, then reads the current rows with the
-SDK's `{"latest": True}` marker (`gateway_settings` and `datapoint_settings`
-filtered on `gateway_id = DEVICE_KEY`), so a row saved during startup is not
-lost. Every row, read or delivered, is applied only when it belongs to this
+SDK's `{"latest": True}` marker, filtered on `gateway_id = DEVICE_KEY` (for
+`assets` a second, best-effort read takes the rows without a gateway, to
+report them), so a row saved during startup is not lost. One read returns at
+most 10000 rows (`READ_LIMIT`, the SDK's limit), which bounds a gateway's
+assets, catalog rows and datapoint settings; hitting it is printed. Every row, read or delivered, is applied only when it belongs to this
 gateway and its `tsp` is newer than the last row applied for that entity
 (rows within 1 ms count as the same row: a read returns epoch milliseconds,
 an event ISO text), so an older read never undoes a newer edit. `deleted` is
 null-safe like `enabled`: only an explicit `true` deletes, so rows a board
 form wrote without the flag are live. Rows of one asset are applied one at a
-time under a per-asset lock, so a slow discovery for a stale row cannot
-override a later edit. After applying a row the core requests a refresh of
+time under a per-asset lock, so a stale row cannot override a later edit;
+a deleting row read at startup goes through the same check, so it cannot
+soft-delete the catalog of an asset the subscription has just brought
+back. After applying a row the core requests a refresh of
 the transforms mapped to that table (see
 [Refreshing the app's transforms](#refreshing-the-apps-transforms)).
 
@@ -204,8 +212,8 @@ the transforms mapped to that table (see
   (6 h) the core rewrites the full latest `datapoints` rows and `assetstatus`
   rows it owns that are older than `Collector.reassert_after` (default 7
   days). Keep every app's `dropAfter` for those tables far above that. The
-  board-written tables are not rewritten: `assets` is kept for 3 years, and
-  `gateways`, `gateway_settings` and `datapoint_settings` have no `dropAfter`.
+  board-written tables are not rewritten, so `assets`, `gateway_settings`
+  and `datapoint_settings` have no `dropAfter`, and neither has `gateways`.
 - **Secrets never go into tables** (boards can read them). Credentials and
   certificates come from device environment or mounted volumes; tables hold
   only non-secret configuration.
@@ -219,8 +227,8 @@ the transforms mapped to that table (see
 
 | Member | Kind | Purpose |
 |---|---|---|
-| `resolve_each_cycle` | class attr | False: resolve datapoints once at (re)configure (cached on `asset["datapoint_list"]`); True: re-resolve every poll cycle (user-authored specs, live edits) |
-| `prepare_datapoints(asset, store)` | abstract | Return datapoint dicts (`id`, `name`, `units` + protocol-private keys); discover and persist catalog metadata via the store |
+| `resolve_each_cycle` | class attr | False: resolve datapoints once per task start (cached on `asset["datapoint_list"]`); True: re-resolve every poll cycle (user-authored specs, live edits) |
+| `prepare_datapoints(asset, store)` | abstract | Return datapoint dicts (`id`, `name`, `units` + protocol-private keys); discover and persist catalog metadata via the store. Runs in the asset's task: a failure marks the asset offline, is reported once and retried after one interval |
 | `create_session(asset)` | abstract | Create the per-asset session. **No I/O in constructors** — sessions are also created in demo mode |
 | `format_value(asset, datapoint, raw)` | abstract | Raw protocol value → scalar for `value` |
 | `make_entry(asset, datapoint, raw)` | overridable | Build the full measurements entry; the hook for per-reading quality/timestamps and live metadata |

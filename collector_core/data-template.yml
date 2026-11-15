@@ -97,13 +97,14 @@ data:
     # The connected protocol endpoints (machines, controllers, servers,
     # masters) reachable from a gateway. One row per asset; identity is
     # (gateway_id, asset_name) — a rename creates a new asset. Apps add
-    # connection parameter columns (host, port, endpoint_url, ...).
+    # connection parameter columns (host, port, endpoint_url, ...). No
+    # dropAfter: nothing rewrites an unchanged asset, so its row must not age
+    # out.
     - tablename: assets
       description: >-
         The assets (machines, controllers, servers) each gateway collects from. Written by the board's forms and
         the AI assistant (config_core); the gateway follows its own rows and never writes this table.
-      chunkTimeInterval: 1 day
-      dropAfter: 3 year
+      chunkTimeInterval: 1 month
       maintainLatestFlagFor: ['gateway_id', 'asset_name']
       columns:
         - id: tsp

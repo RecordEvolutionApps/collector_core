@@ -157,6 +157,7 @@ async def test_followed_tables_are_subscribed_before_they_are_read():
         ("read", "datapoints"),  # the gateway's own catalog: read, not followed
         ("subscribe", "datapoint_settings"), ("read", "datapoint_settings"),
         ("subscribe", "assets"), ("read", "assets"),
+        ("read", "assets"),  # the rows without a gateway, to report them
     ]
 
 
@@ -443,3 +444,53 @@ async def test_a_deleted_incomplete_row_is_not_reported():
 
 async def test_the_core_has_no_asset_writer():
     assert not hasattr(Collector, "soft_delete_asset")
+
+
+async def test_assets_are_read_per_gateway_and_rows_without_one_separately():
+    fake = FakeIF()
+    c = _collector(fake)
+    _record_configures(c)
+    reads = []
+    real = fake.getHistory
+
+    async def get_history(table, params):
+        reads.append((table, params))
+        return await real(table, params)
+
+    fake.getHistory = get_history
+    await c.load_asset_configs()
+    own, orphans = [params for table, params in reads if table == "assets"]
+    assert {"column": "gateway_id", "operator": "=", "value": 1} in own["filterAnd"]
+    assert own["limit"] == 10000
+    assert {"column": "gateway_id", "operator": "IS NULL"} in orphans["filterAnd"]
+
+
+async def test_a_refused_read_of_rows_without_a_gateway_does_not_stop_startup():
+    fake = FakeIF(rows={"assets": [_asset(_ms(1))]})
+    c = _collector(fake)
+    configured = _record_configures(c)
+    real = fake.getHistory
+
+    async def get_history(table, params):
+        if any(f.get("operator") == "IS NULL" for f in params["filterAnd"]):
+            raise RuntimeError("operator not supported")
+        return await real(table, params)
+
+    fake.getHistory = get_history
+    await c.load_asset_configs()
+    assert [a["asset_name"] for a in configured] == ["A"]
+
+
+async def test_a_stale_deleted_row_at_startup_keeps_the_catalog_of_a_newer_live_asset():
+    # The subscription applies a live row while the read still returns the
+    # older deleting row: the catalog must stay.
+    async def store_live_row(fake):
+        await fake.deliver("assets", _asset(_iso(2)))
+
+    fake = FakeIF(rows={"assets": [_asset(_ms(1), deleted=True)]},
+                  during_read={"assets": store_live_row})
+    c = _collector(fake)
+    _record_configures(c)
+    c.store = DatapointStore(fake, 1, [_dp("t", _ms(0))])
+    await c.load_asset_configs()
+    assert not [row for table, row in fake.written if table == "datapoints"]

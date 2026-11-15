@@ -201,3 +201,22 @@ async def test_a_failed_background_write_keeps_the_rows_buffered():
     c.ironflock.fail_on = None
     await c._flush()                          # the flush loop's retry
     assert not c._buffer and c.ironflock.calls == [("measurements", [{"asset_name": "A", "data": {}}])]
+
+
+async def test_requeue_into_a_full_buffer_drops_the_oldest_rows():
+    # The drain takes m1..m3 and fails; meanwhile n1, n2 were appended. With
+    # room for 4, the re-queue keeps the newest four and counts the drop.
+    c = _collector([], fail_on="measurements")
+    c._buffer = deque([("measurements", "m1"), ("measurements", "m2"),
+                       ("measurements", "m3")], maxlen=4)
+
+    async def append_meanwhile(table, rows):
+        c._buffer.append(("measurements", "n1"))
+        c._buffer.append(("measurements", "n2"))
+        raise RuntimeError("link down")
+
+    c.ironflock.append_rows_to_table = append_meanwhile
+    await c._flush()
+    assert [row for _, row in c._buffer] == ["m2", "m3", "n1", "n2"]
+    assert c._buffer.maxlen == 4
+    assert c._dropped_rows == 1

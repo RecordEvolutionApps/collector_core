@@ -178,8 +178,9 @@ class DatapointStore:
         Each payload is a full ``datapoints`` row in the protocol's own schema
         (all columns except ``tsp``) and must contain ``datapoint_id``. Rows
         already present with identical values are skipped, so calling this
-        repeatedly is cheap. The written row is the payload as given: nothing
-        of the existing row is carried over.
+        repeatedly is cheap. The written row is the payload as given, with
+        ``deleted: False`` unless the payload says otherwise: nothing of the
+        existing row is carried over.
         """
         stored = 0
         for payload in payloads:
@@ -202,7 +203,9 @@ class DatapointStore:
             ):
                 continue
 
-            record = {**payload, "tsp": _now()}
+            # deleted False: a column the row leaves out keeps its value, so a
+            # datapoint that comes back after a soft-delete would stay deleted.
+            record = {"deleted": False, **payload, "tsp": _now()}
             print("storing datapoint", record)
             if self.store_data:
                 await self._ironflock.append_to_table("datapoints", record)
@@ -369,8 +372,9 @@ class ProtocolAdapter(ABC):
         Raise a ``CollectorError`` subclass from ``collector_core.errors`` with a
         ``user_message`` on failure: ``ConfigurationError`` for an invalid spec /
         unknown profile / missing field, ``DeviceConnectionError`` when discovery
-        can't reach the device. The core reports it (as an asset-config or offline
-        error) and skips/retries the asset.
+        can't reach the device. It runs in the asset's collection task, so the
+        core handles a failure like a failed read: it marks the asset offline,
+        reports it once, and retries after one interval.
         """
 
     @abstractmethod

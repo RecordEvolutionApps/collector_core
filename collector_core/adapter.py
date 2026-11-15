@@ -6,7 +6,7 @@ A protocol provides:
     collect for an asset (optionally discovering + persisting metadata), how
     to normalise raw values into measurement entries, and optionally how to
     run protocol-level background work (network discovery) and consume
-    gateway-level settings, and
+    per-gateway settings (the ``gateway_settings`` row), and
   - a ``ProtocolSession`` (one per asset task) that owns any connection and
     produces raw value batches — either by being polled (``read_values``) or
     by pushing at its own cadence (a ``stream`` override).
@@ -27,10 +27,13 @@ from collector_core.storable import repair_text, storable
 # Columns the platform stamps onto rows it returns; never echo them back.
 PLATFORM_COLUMNS = ("tsp", "latest_flag", "authid", "device_key")
 
-# Datapoints columns describing what demo mode should produce for one
-# datapoint, so synthetic data is plausible in context instead of uniform
-# noise (see collector_core.demo). Read live from the catalog, so tuning a
-# demo signal on the board takes effect on the next cycle.
+# Columns describing what demo mode should produce for one datapoint, so
+# synthetic data is plausible in context instead of uniform noise (see
+# collector_core.demo). The user sets them in datapoint_settings; the
+# datapoints catalog may carry defaults an adapter derives from its spec. The
+# settings value wins when it is not null, then the catalog's, then the
+# adapter's resolved dict; read live, so tuning a demo signal on the board
+# takes effect on the next cycle.
 #  - demo_value:    the value the reading should sit at, in ENGINEERING units.
 #                   A boolean makes it a state that rests there. Null/missing
 #                   keeps demo mode's historical 0..100 range.
@@ -39,19 +42,15 @@ PLATFORM_COLUMNS = ("tsp", "latest_flag", "authid", "device_key")
 #                   Null/missing means +-10% of demo_value.
 DEMO_DATAPOINT_COLUMNS = ("demo_value", "demo_variance")
 
-# Datapoints columns owned by the user via the board (per-datapoint pause,
-# change detection and demo tuning), not by protocol discovery. The store
-# preserves them across metadata re-discovery so a device-driven catalog
-# rewrite never clobbers a user's choice; the collector reads them to gate
-# measurement writes and to shape demo values.
+# The columns of datapoint_settings the core reads: the user's per-datapoint
+# switches, written by the board and the AI assistant, never by the gateway.
 #  - enabled:          pause switch, null-safe (only an explicit false pauses;
 #                      missing/null means the datapoint is collected).
 #  - change_detection: when true, the datapoint is written only when its value
 #                      differs from the last written value (missing/null/false
 #                      stores every reading).
-# An adapter that resolves one of these from its own spec still wins: the store
-# only fills in a column the adapter's payload does not carry.
-USER_DATAPOINT_COLUMNS = ("enabled", "change_detection") + DEMO_DATAPOINT_COLUMNS
+#  - demo_value, demo_variance: see DEMO_DATAPOINT_COLUMNS.
+DATAPOINT_SETTINGS_COLUMNS = ("enabled", "change_detection") + DEMO_DATAPOINT_COLUMNS
 
 
 def _now():
@@ -99,9 +98,12 @@ class DatapointsChanged(Exception):
 class DatapointStore:
     """Persist datapoint metadata to the ``datapoints`` table.
 
-    Wraps the in-memory datapoints list (kept in sync by the core's table
-    subscription) and the IronFlock handle so an adapter can store/prune
-    metadata without knowing about IronFlock or the device key.
+    Wraps the in-memory datapoints catalog (read by the core at startup; the
+    store keeps it current as it writes) and the IronFlock handle so an
+    adapter can store/prune metadata without knowing about IronFlock or the
+    device key. The gateway is the catalog's only writer: the rows hold what
+    the device and the adapter know, never the user's settings (those live in
+    ``datapoint_settings``).
 
     The store is column-agnostic: each protocol's ``datapoints`` schema
     differs beyond the core contract columns (MTConnect has
@@ -113,13 +115,18 @@ class DatapointStore:
     With ``store_data`` False the in-memory state is still maintained but
     nothing is written to the platform (forward-only mode). The attribute is
     public so the core can toggle it live with the gateway settings.
+
+    ``on_write`` is called with the table name (``"datapoints"``) after an
+    ``upsert`` or ``prune`` wrote rows; the core passes its
+    ``request_refresh``.
     """
 
-    def __init__(self, ironflock, device_key, datapoints, store_data=True):
+    def __init__(self, ironflock, device_key, datapoints, store_data=True, on_write=None):
         self._ironflock = ironflock
         self._device_key = device_key
         self._datapoints = datapoints
         self.store_data = store_data
+        self.on_write = on_write
 
     @property
     def device_key(self):
@@ -149,6 +156,14 @@ class DatapointStore:
         except (TypeError, ValueError):
             return str(value)
 
+    def _wrote(self):
+        if self.on_write is None:
+            return
+        try:
+            self.on_write("datapoints")
+        except Exception as e:
+            print(f"datapoints write callback failed: {e}")
+
     def _drop_row(self, asset_name, datapoint_id):
         self._datapoints[:] = [
             row
@@ -163,9 +178,8 @@ class DatapointStore:
         Each payload is a full ``datapoints`` row in the protocol's own schema
         (all columns except ``tsp``) and must contain ``datapoint_id``. Rows
         already present with identical values are skipped, so calling this
-        repeatedly is cheap. User-owned columns (``USER_DATAPOINT_COLUMNS``)
-        are carried over from the existing row, so re-discovering metadata never
-        clobbers a user's pause / change-detection choice.
+        repeatedly is cheap. The written row is the payload as given: nothing
+        of the existing row is carried over.
         """
         stored = 0
         for payload in payloads:
@@ -189,12 +203,6 @@ class DatapointStore:
                 continue
 
             record = {**payload, "tsp": _now()}
-            # Preserve user-set columns the protocol does not manage across a
-            # metadata-driven rewrite (the payload never carries them).
-            if current is not None:
-                for column in USER_DATAPOINT_COLUMNS:
-                    if column not in record and current.get(column) is not None:
-                        record[column] = current[column]
             print("storing datapoint", record)
             if self.store_data:
                 await self._ironflock.append_to_table("datapoints", record)
@@ -203,6 +211,8 @@ class DatapointStore:
             stored += 1
         if stored:
             print(f"Stored {stored} datapoint(s) for {asset_name}")
+            if self.store_data:
+                self._wrote()
 
     async def prune(self, asset_name, keep_ids):
         """Soft-delete datapoints for this asset no longer in ``keep_ids``."""
@@ -226,6 +236,8 @@ class DatapointStore:
 
         if stale:
             print(f"Pruned {len(stale)} stale datapoint(s) for {asset_name}")
+            if self.store_data:
+                self._wrote()
 
 
 class ProtocolSession(ABC):
@@ -383,13 +395,15 @@ class ProtocolAdapter(ABC):
             "value": self.format_value(asset, datapoint, raw_value),
         }
 
-    async def apply_settings(self, gateway_row: dict) -> None:
-        """Consume gateway-level settings (columns of this gateway's row in
-        the ``gateways`` table). Called once before assets are configured and
-        again whenever the row changes. Adapters read their own settings
-        columns here and fall back to built-in defaults for missing ones; a
-        setting that cannot be applied live should be logged as requiring a
-        restart. The default does nothing.
+    async def apply_settings(self, settings_row: dict) -> None:
+        """Consume per-gateway settings: this gateway's row of the
+        ``gateway_settings`` table, which the board writes (``{}`` while it has
+        none). Called once before assets are configured and again whenever a
+        newer row arrives. Adapters read their own settings columns here (an
+        app adds them to ``gateway_settings`` in its data-template) and fall
+        back to built-in defaults for missing ones; a setting that cannot be
+        applied live should be logged as requiring a restart. The default does
+        nothing.
         """
         return None
 

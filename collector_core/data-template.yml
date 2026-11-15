@@ -1,74 +1,107 @@
 # yaml-language-server: $schema=https://ironflock.com/schemas/data-template/v1.yml
 #
-# CANONICAL CORE TABLE CONTRACT for IronFlock collector apps
-# ----------------------------------------------------------
+# CANONICAL CORE TABLE CONTRACT for IronFlock collector apps (collector_core v3)
+# ------------------------------------------------------------------------------
 # This file is NOT imported at runtime. It documents the data structure that
 # every collector app built on collector_core must provide in its own
-# .ironflock/data-template.yml: the five tables below with exactly these core
+# .ironflock/data-template.yml: the seven tables below with exactly these core
 # columns. Apps EXTEND the tables with protocol-specific columns (connection
-# parameters on `assets`, address/decode metadata on `datapoints`, gateway
-# settings on `gateways`) but must not remove or repurpose the core columns.
+# parameters on `assets`, address/decode metadata on `datapoints`, their own
+# settings on `gateway_settings`) but must not remove or repurpose the core
+# columns.
 #
 # Conventions:
+# - Every table has exactly one writer, named in its description. The gateway
+#   writes what it measures and registers; the board (and the AI assistant)
+#   writes what users decide. The only exception is the delete row the board
+#   writes to `gateways`.
 # - `tsp` is mandatory on every table (platform requirement).
 # - Identity keys (maintainLatestFlagFor) must match exactly: rows are
 #   semantically updated by appending with the same key columns.
+# - gateway_id is the gateway's DEVICE_KEY everywhere.
 # - Secrets (passwords, certificates) never go into tables — use device
 #   environment or mounted volumes instead.
 # - chunkTimeInterval / dropAfter are deployment-tunable defaults.
 
 data:
   tables:
-    # The edge PCs (gateways) this app runs on: registry written by the core
-    # at startup (echo-merging existing columns) + per-gateway settings
-    # edited by users. Apps add their own settings columns (e.g. scan
-    # intervals, protocol identities).
+    # The edge PCs (gateways) this app runs on. Each gateway registers itself
+    # at startup; nothing deletes a row automatically.
     - tablename: gateways
+      description: >-
+        The gateways (edge PCs) this app runs on. Written by the gateway about itself: each gateway writes its
+        row at startup with deleted false. The board writes only delete rows, {gateway_id, deleted: true}.
       chunkTimeInterval: 1 year
-      maintainLatestFlagFor: [gateway_name]
+      maintainLatestFlagFor: [gateway_id]
       columns:
         - id: tsp
           name: Timestamp
           description: Timestamp of data entry
           dataType: timestamp
+        - id: gateway_id
+          name: Gateway ID
+          description: The gateway's DEVICE_KEY, written by the gateway. Identity of the row.
+          dataType: numeric
         - id: gateway_name
           name: Gateway Name
-          description: Name of the gateway (edge PC) this app runs on
+          description: The gateway's DEVICE_NAME at its last start, a plain value written by the gateway (not an identity).
           dataType: string
-        - id: deleted
-          name: Deleted Flag
-          description: Marks a gateway as deleted
-          dataType: boolean
-        - id: store_data
-          name: Store Data
-          description: If false, the app reads its configuration but writes no collected data (forward-only mode). Missing/null means true.
-          dataType: boolean
-        - id: buffer_size
-          name: Buffer Size
-          description: Max number of data rows to buffer locally while the cloud link is down; flushed in order on reconnect. Oldest dropped when full. Missing/null uses the app default.
-          dataType: numeric
         - id: info
           name: Info
-          description: Additional gateway information (JSON), e.g. runtime details written by the app. Open for future extension.
+          description: Runtime details the gateway writes at startup (JSON), e.g. app start time and Python version.
           dataType: json
         - id: url
           name: Remote Access URLs
           description: >-
-            Resolved remote-access URLs for this gateway's declared ports (JSON), written by the core at
+            Resolved remote-access URLs for this gateway's declared ports (JSON), written by the gateway at
             registration. A JSON object keyed by the port number (string) mapping to {name, protocol, main,
             local?, cloud?} - one entry per port in the app's port template, so the frontend can look a port
             up directly. cloud.url is the tunnel URL exactly as the ironflock SDK's getRemoteAccessUrlForPort
             returns it (directly embeddable as an iframe src; a development run's own -dev tunnel in a dev
             run), absent while the tunnel/identity is not available. local.url is the LAN endpoint
-            (DEVICE_LAN_IP and the mapped host port). Empty/absent when the app declares no remote-access
-            ports.
+            (DEVICE_LAN_IP and the mapped host port). Absent when the app declares no remote-access ports.
           dataType: json
+        - id: deleted
+          name: Deleted Flag
+          description: >-
+            True when a user deleted the gateway on the board (the board's only write to this table). The
+            gateway writes false at every start, so a gateway that runs again reappears.
+          dataType: boolean
+
+    # Users' per-gateway settings. Apps add their own settings columns (e.g.
+    # iodd_autofetch, scan intervals).
+    - tablename: gateway_settings
+      description: >-
+        Users' per-gateway settings, written by the board. The gateway follows its own row (subscribe, then read
+        the latest) and never writes this table. No row means defaults.
+      chunkTimeInterval: 1 year
+      maintainLatestFlagFor: [gateway_id]
+      columns:
+        - id: tsp
+          name: Timestamp
+          description: Timestamp of data entry
+          dataType: timestamp
+        - id: gateway_id
+          name: Gateway ID
+          description: The gateway the settings apply to; joins on gateway_id in the gateways table.
+          dataType: numeric
+        - id: store_data
+          name: Store Data
+          description: If false, the gateway reads its configuration but writes no collected data (forward-only mode). Missing/null means true.
+          dataType: boolean
+        - id: buffer_size
+          name: Buffer Size
+          description: Max number of data rows to buffer locally while the cloud link is down; flushed in order on reconnect. Oldest dropped when full. Missing/null uses the app default.
+          dataType: numeric
 
     # The connected protocol endpoints (machines, controllers, servers,
     # masters) reachable from a gateway. One row per asset; identity is
     # (gateway_id, asset_name) — a rename creates a new asset. Apps add
     # connection parameter columns (host, port, endpoint_url, ...).
     - tablename: assets
+      description: >-
+        The assets (machines, controllers, servers) each gateway collects from. Written by the board's forms and
+        the AI assistant (config_core); the gateway follows its own rows and never writes this table.
       chunkTimeInterval: 1 day
       dropAfter: 3 year
       maintainLatestFlagFor: ['gateway_id', 'asset_name']
@@ -83,7 +116,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: Joins on device_key in the gateways table.
+          description: The gateway that collects the asset; joins on gateway_id in the gateways table.
           dataType: numeric
         - id: datapoint_spec
           name: Datapoint Spec
@@ -103,7 +136,7 @@ data:
           dataType: boolean
         - id: deleted
           name: Deleted Flag
-          description: Deleted Flag
+          description: True deletes the asset; the gateway then stops it and soft-deletes its datapoints and status. Missing/null means live.
           dataType: boolean
         # Optional convention for apps with network discovery:
         # - id: auto_registered
@@ -112,10 +145,14 @@ data:
         #   dataType: boolean
 
     # The catalog of single value streams per asset, discovered by the
-    # protocol or derived from the datapoint_spec; maintained automatically
+    # protocol or derived from the datapoint_spec; maintained by the gateway
     # (upsert + soft-delete). Apps add protocol metadata columns (register
-    # offset, object type, node class, port/sensor identity, ...).
+    # offset, object type, node class, port/sensor identity, ...). The user's
+    # per-datapoint switches live in datapoint_settings.
     - tablename: datapoints
+      description: >-
+        The catalog of value streams per asset, written only by the gateway (discovery, the datapoint spec,
+        soft-deletes when a datapoint or its asset is gone). Holds what the device knows, never user settings.
       chunkTimeInterval: 1 day
       dropAfter: 3 months
       maintainLatestFlagFor: ['gateway_id', 'asset_name', 'datapoint_id']
@@ -134,7 +171,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: Joins on device_key in the gateways table.
+          description: The gateway that collects the datapoint; joins on gateway_id in the gateways table.
           dataType: numeric
         - id: name
           name: Name
@@ -147,6 +184,48 @@ data:
         - id: path
           name: Path
           description: Hierarchical locator of the datapoint within the asset (protocol-defined, e.g. port3, slot2/subslot1, Objects/Boiler1, Axes/X). Empty for flat protocols.
+          dataType: string
+        - id: demo_value
+          name: Default Demo Value
+          description: >-
+            Optional default for demo mode that the adapter derives from its spec: the value the datapoint
+            sits at, in engineering units. datapoint_settings.demo_value overrides it.
+          dataType: string
+        - id: demo_variance
+          name: Default Demo Variance
+          description: >-
+            Optional default for demo mode that the adapter derives from its spec: how far a reading wanders
+            from demo_value. datapoint_settings.demo_variance overrides it.
+          dataType: numeric
+        - id: deleted
+          name: Deleted Flag
+          description: True when the datapoint (or its asset) is gone; written by the gateway.
+          dataType: boolean
+
+    # The user's per-datapoint switches. No dropAfter: nothing rewrites these
+    # rows, so they must not age out.
+    - tablename: datapoint_settings
+      description: >-
+        Users' per-datapoint switches, written by the board and the AI assistant (configured_by says which).
+        The gateway follows its own rows (subscribe, then read the latest) and never writes this table.
+      chunkTimeInterval: 1 month
+      maintainLatestFlagFor: ['gateway_id', 'asset_name', 'datapoint_id']
+      columns:
+        - id: tsp
+          name: Timestamp
+          description: Timestamp of data entry
+          dataType: timestamp
+        - id: gateway_id
+          name: Gateway ID
+          description: The gateway that collects the datapoint; joins on gateway_id in the gateways table.
+          dataType: numeric
+        - id: asset_name
+          name: Asset Name
+          description: Name of the asset the datapoint belongs to
+          dataType: string
+        - id: datapoint_id
+          name: Datapoint ID
+          description: The datapoint_id in the datapoints catalog.
           dataType: string
         - id: enabled
           name: Enabled
@@ -161,19 +240,21 @@ data:
           description: >-
             Demo mode only - the value this datapoint should sit at, in engineering units (what the board
             shows, not the raw protocol value). Readings wander around it within demo_variance. Set it to a
-            boolean instead to get a state that rests there. Missing/null keeps the default 0-100 range.
+            boolean instead to get a state that rests there. Missing/null falls back to the catalog's default,
+            then to the 0-100 range.
           dataType: string
         - id: demo_variance
           name: Demo Variance
           description: >-
             Demo mode only - how far a reading may wander from demo_value (plus/minus, same units); 0 pins it
             to a constant. For a boolean demo_value it is instead the per-sample chance (0-1) of blipping out
-            of that state. Missing/null means plus/minus 10% of demo_value.
+            of that state. Missing/null falls back to the catalog's default, then to plus/minus 10% of
+            demo_value.
           dataType: numeric
-        - id: deleted
-          name: Deleted Flag
-          description: Deleted Flag
-          dataType: boolean
+        - id: configured_by
+          name: Configured By
+          description: Who wrote the row - "board" for board forms, "agent" for the AI assistant.
+          dataType: string
 
     # The actual timeseries recordings: one row per asset per collected
     # batch. `data` holds one entry per datapoint with the standard shape
@@ -181,6 +262,7 @@ data:
     # ...). Rows are snapshots: a row contains the full current state of the
     # asset (push protocols merge last-known values per window).
     - tablename: measurements
+      description: Timeseries recordings, one row per asset per collected batch. Written by the gateway.
       chunkTimeInterval: 1 hour
       dropAfter: 3 months
       columns:
@@ -194,7 +276,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: Joins on device_key in the gateways table.
+          description: The gateway that collects the asset; joins on gateway_id in the gateways table.
           dataType: numeric
         - id: data
           name: Data
@@ -205,6 +287,7 @@ data:
     # paused): latest row per asset = current state, full history =
     # availability log. Fully core-owned; no protocol columns.
     - tablename: assetstatus
+      description: Asset state transitions (online, offline, paused). Written by the gateway.
       chunkTimeInterval: 1 week
       dropAfter: 3 months
       maintainLatestFlagFor: ['gateway_id', 'asset_name']
@@ -219,7 +302,7 @@ data:
           dataType: string
         - id: gateway_id
           name: Gateway ID
-          description: Joins on device_key in the gateways table.
+          description: The gateway that collects the asset; joins on gateway_id in the gateways table.
           dataType: numeric
         - id: status
           name: Status
@@ -231,5 +314,5 @@ data:
           dataType: string
         - id: deleted
           name: Deleted Flag
-          description: Deleted Flag
+          description: True once the asset is deleted; written by the gateway.
           dataType: boolean

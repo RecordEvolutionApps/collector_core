@@ -2,8 +2,8 @@
 
 Retention drops whole chunks, the latest row of an entity included, so a
 catalog row or an asset status that never changes used to age out after the
-table's dropAfter: the board lost the datapoint, and the user's per-datapoint
-pause / change-detection setting with it.
+table's dropAfter: the board lost the datapoint. The rewritten rows hold only
+what the gateway wrote (the catalog has no user columns).
 """
 
 import asyncio
@@ -58,7 +58,7 @@ def _old(days):
 
 def _row(dp, tsp, **extra):
     return {"datapoint_id": dp, "asset_name": "A", "gateway_id": 1, "name": dp,
-            "enabled": False, "deleted": False, "tsp": tsp,
+            "units": "C", "path": "", "deleted": False, "tsp": tsp,
             "latest_flag": True, "authid": "1", "device_key": 1, **extra}
 
 
@@ -79,8 +79,8 @@ async def test_old_catalog_rows_are_rewritten_whatever_their_tsp_form():
     assert table == "datapoints"
     assert sorted(r["datapoint_id"] for r in rows) == ["dt", "iso", "ms", "zulu"]
     for r in rows:
-        # The full row, user-owned columns included, minus platform columns.
-        assert r["enabled"] is False and r["name"] == r["datapoint_id"]
+        # The full row minus platform columns.
+        assert r["units"] == "C" and r["name"] == r["datapoint_id"]
         assert not {"latest_flag", "authid", "device_key"} & set(r)
         assert core._epoch_seconds(r["tsp"]) > time.time() - 60
 

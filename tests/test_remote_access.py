@@ -152,17 +152,44 @@ async def test_register_gateway_omits_url_when_no_ports():
     assert "url" not in payload  # inert for apps that declare no ports
 
 
-async def test_register_gateway_recomputes_url_not_echoes_stale(monkeypatch):
+async def test_register_gateway_computes_url_from_the_environment(monkeypatch):
     for var in ("DEVICE_KEY", "APP_NAME", "INSTANCE_KEY", "DEVICE_LAN_IP"):
         monkeypatch.delenv(var, raising=False)
     fake = FakeIF()
     c = _collector([{"name": "Web", "port": 80}], fake)
-    # A stale legacy-url entry from a previously loaded gateway row must not
-    # survive — the column is fully recomputed from the current environment.
-    c.gateway = {"gateway_name": "dev", "url": {"80": {"name": "Web", "url": "https://stale"}}}
+    c.gateway_extra = {"url": {"80": {"name": "Web", "url": "https://stale"}}}
     await c.register_gateway()
     (_, payload) = fake.appended[-1]
     assert payload["url"] == {"80": {"name": "Web", "protocol": "http", "main": False}}
+
+
+# ------------------------------------------------------------ registration row
+
+
+async def test_the_registration_row_is_keyed_by_the_device_key():
+    fake = FakeIF()
+    c = Collector(device_name="dev", device_key=42, adapter=_Adapter())
+    c.set_ironflock(fake)
+    await c.register_gateway()
+    (table, payload) = fake.appended[-1]
+    assert table == "gateways"
+    assert set(payload) == {"tsp", "gateway_id", "gateway_name", "info", "deleted"}
+    assert payload["gateway_id"] == 42
+    assert payload["gateway_name"] == "dev"
+    assert payload["deleted"] is False
+    assert set(payload["info"]) == {"app_started", "python"}
+
+
+async def test_the_registration_row_echoes_nothing_and_carries_no_settings():
+    fake = FakeIF()
+    c = Collector(device_name="dev", device_key=42, adapter=_Adapter())
+    c.set_ironflock(fake)
+    # settings the board wrote stay in gateway_settings; nothing is copied over
+    c.settings = {"tsp": 1, "gateway_id": 42, "store_data": False, "buffer_size": 5}
+    await c.register_gateway()
+    (_, payload) = fake.appended[-1]
+    assert not {"store_data", "buffer_size", "latest_flag", "device_key"} & set(payload)
+    assert not hasattr(c, "gateway")
 
 
 # ------------------------------------------------------- load_ports_from_template
@@ -261,11 +288,14 @@ async def test_gateway_extra_never_overrides_core_columns():
     fake = FakeIF()
     c = Collector(device_name="dev", device_key=42, adapter=_Adapter())
     c.set_ironflock(fake)
-    c.gateway_extra = {"gateway_name": "impostor", "deleted": True, "qds_role": "backend"}
+    c.gateway_extra = {"gateway_name": "impostor", "gateway_id": 7, "deleted": True,
+                       "info": "x", "url": "x", "qds_role": "backend"}
     await c.register_gateway()
     (_, payload) = fake.appended[-1]
     assert payload["gateway_name"] == "dev"
+    assert payload["gateway_id"] == 42
     assert payload["deleted"] is False
+    assert isinstance(payload["info"], dict) and "url" not in payload
     assert payload["qds_role"] == "backend"
 
 

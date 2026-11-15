@@ -13,96 +13,173 @@ platform templates.
 │ .ironflock/        — data-template.yml (core contract + protocol columns) │
 │                      board-template.yml (app boards)                      │
 ├────────────────────── collector_core (this package) ─────────────────────┤
-│ Collector          — gateway settings, asset/datapoint config + live      │
-│                      subscriptions, one task per asset, measurements      │
-│                      assembly, assetstatus tracking, store_data gating    │
+│ Collector          — gateway registration, follows the board's settings  │
+│                      and assets, one task per asset, measurements         │
+│                      assembly, assetstatus tracking, store_data gating,   │
+│                      transform refreshes                                  │
 │ DatapointStore     — column-agnostic datapoints catalog (upsert/prune)    │
 │ DemoSignal         — per-datapoint synthetic values for demo mode         │
 │ ProtocolAdapter/ProtocolSession/DatapointsChanged — the protocol seam     │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Data model (five tables)
+## Data model (seven tables)
 
 The canonical core contract ships as
 [`collector_core/data-template.yml`](collector_core/data-template.yml).
 Every app's own `.ironflock/data-template.yml` must provide these tables with
 the core columns and may extend them with protocol-specific columns.
 
-| Table | Purpose | Identity (latest-flag) | Core columns |
+Every table has exactly one writer. The gateway writes what it is and what it
+measures; the board (and the AI assistant, through config_core) writes what
+users decide. `gateway_id` is the gateway's `DEVICE_KEY` in every table.
+
+| Table | Writer | Identity (latest-flag) | Core columns |
 |---|---|---|---|
-| `gateways` | registry + per-gateway settings | gateway_name | tsp, gateway_name, deleted, store_data, info (json), url (json) |
-| `assets` | connected protocol endpoints | gateway_id, asset_name | tsp, asset_name, gateway_id, datapoint_spec, collect_interval, enabled, demo_mode, deleted |
-| `datapoints` | value-stream catalog per asset | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, enabled, change_detection, demo_value, demo_variance, deleted |
-| `measurements` | timeseries recordings | — (append-only) | tsp, asset_name, gateway_id, data (json) |
-| `assetstatus` | state transitions (core-owned) | gateway_id, asset_name | tsp, asset_name, gateway_id, status, detail, deleted |
+| `gateways` | the gateway, about itself (the board writes only delete rows) | gateway_id | tsp, gateway_id, gateway_name, info (json), url (json), deleted |
+| `gateway_settings` | the board | gateway_id | tsp, gateway_id, store_data, buffer_size |
+| `assets` | the board's forms and the AI assistant | gateway_id, asset_name | tsp, asset_name, gateway_id, datapoint_spec, collect_interval, enabled, demo_mode, deleted |
+| `datapoints` | the gateway (the catalog) | gateway_id, asset_name, datapoint_id | tsp, datapoint_id, asset_name, gateway_id, name, units, path, demo_value, demo_variance, deleted |
+| `datapoint_settings` | the board and the AI assistant | gateway_id, asset_name, datapoint_id | tsp, gateway_id, asset_name, datapoint_id, enabled, change_detection, demo_value, demo_variance, configured_by |
+| `measurements` | the gateway | — (append-only) | tsp, asset_name, gateway_id, data (json) |
+| `assetstatus` | the gateway | gateway_id, asset_name | tsp, asset_name, gateway_id, status, detail, deleted |
 
-Key semantics:
+Apps add their own columns: connection parameters on `assets`, protocol
+metadata on `datapoints`, their own per-gateway settings on `gateway_settings`
+(e.g. `iodd_autofetch`).
 
-- **assets.enabled** — pause/run switch. Only an explicit `false` pauses
+### gateways
+
+The gateway registers itself at startup with one row:
+`{tsp, gateway_id, gateway_name, info, url, deleted: false}` plus the app's
+`gateway_extra` columns (the core-owned columns win). `gateway_id` is the
+identity; `gateway_name` is the device's `DEVICE_NAME` as a plain value, so a
+renamed device stays the same gateway. `url` is written only when the app
+declares remote-access ports (see [below](#remote-access-urls-gatewaysurl)).
+Nothing of an earlier row is echoed.
+
+A user deletes a gateway on the board with a row `{gateway_id, deleted:
+true}`. Nothing deletes a gateway automatically, and a deleted gateway that
+starts again writes `deleted: false` and reappears. The core neither reads
+nor follows `gateways`.
+
+### gateway_settings
+
+The users' per-gateway settings, one row per gateway, written by the board.
+The core follows this gateway's row (see [Following](#following-the-board-written-tables)):
+
+- **store_data** — `false` switches the gateway to forward-only mode:
+  configuration is still read live, but measurements, datapoints and
+  assetstatus are not written. The registration row is still written.
+  Null/missing means the constructor's `store_data` (default true).
+- **buffer_size** — rows held in the outbound buffer while the link is down;
+  null/missing means `DEFAULT_BUFFER_SIZE` (10000).
+
+Every applied row is also handed to `adapter.apply_settings(row)`, and at
+startup the adapter gets the row read then, or `{}` when the board has written
+none. Without a row the defaults apply.
+
+### assets
+
+Written by the board's forms and the AI assistant; the core only reads it.
+
+- **enabled** — pause/run switch. Only an explicit `false` pauses
   collection (no task, demo included); null/missing means running, so rows
   and board forms that omit the column keep working.
-- **assets.collect_interval** — seconds between collected batches. Poll
-  period for polled protocols, publish/batch window for subscription or
-  streaming protocols, downsample window for high-rate feeds.
-- **assets.datapoint_spec** — protocol-defined selection/decode spec
+- **collect_interval** — seconds between collected batches. Poll period for
+  polled protocols, publish/batch window for subscription or streaming
+  protocols, downsample window for high-rate feeds.
+- **datapoint_spec** — protocol-defined selection/decode spec
   (MTConnect/BACnet/OPC UA: id filter list; Modbus/Profinet: authored
   register/record map in YAML). Empty = collect everything discoverable.
-- **datapoints.enabled / datapoints.change_detection** — per-datapoint write
-  gating applied by the core in `_publish_batch`, read live from the catalog
-  so board edits take effect on the next cycle (no asset restart, no adapter
-  change). `enabled` is the null-safe pause switch (only an explicit `false`
-  drops the datapoint from every row, mirroring `assets.enabled`).
-  `change_detection` writes the datapoint only when its `value` differs from
-  the last published value (the first reading after start/enable is the
-  baseline). Both are user-owned: the store preserves them across metadata
-  re-discovery (`USER_DATAPOINT_COLUMNS`). Defaults (null) keep the prior
-  full-snapshot behaviour.
-- **datapoints.demo_value / datapoints.demo_variance** — what demo mode should
-  produce for this datapoint, so synthetic data is plausible in context (a
-  temperature sits at 75 °C ±2, not a random 0–100). `demo_value` is the value
-  the reading sits at, in **engineering units** — adapters must not apply their
+- **deleted** — `true` stops the asset; the core then soft-deletes the
+  asset's `datapoints` rows (it is the catalog's writer) and its
+  `assetstatus`. Catalog rows of an asset deleted while the gateway was not
+  running are soft-deleted at the next start. With `store_data` false nothing
+  is written.
+- An incomplete row (no `asset_name`, or no `gateway_id`) is skipped and
+  reported once as a warning, telling the user to complete or delete it on the
+  board. A row without a gateway is reported by every gateway; a nameless row
+  only by the gateway it names.
+
+### datapoints
+
+The catalog of value streams per asset, written only by the gateway through
+`DatapointStore` (discovery, the datapoint spec, soft-deletes of datapoints
+that are gone). It holds what the device and the adapter know and no user
+settings: `upsert` writes the adapter's payload as given, nothing of the
+previous row is carried over. `demo_value` / `demo_variance` are optional
+defaults an adapter derives from its spec. The core reads this gateway's
+catalog once at startup; the store keeps the in-memory list current as it
+writes, so the table is not followed.
+
+### datapoint_settings
+
+The user's per-datapoint switches, written by the board (`configured_by:
+"board"`) and the AI assistant (`configured_by: "agent"`), never by the
+gateway. The template gives the table no `dropAfter`: nothing rewrites these
+rows, so they must not age out. The core follows this gateway's rows into
+`Collector.datapoint_settings`, keyed `(asset_name, datapoint_id)`.
+
+- **enabled / change_detection** — per-datapoint write gating applied in
+  `_publish_batch`, so a board edit takes effect on the next cycle (no asset
+  restart, no adapter change). `enabled` is the null-safe pause switch (only
+  an explicit `false` drops the datapoint from every row, mirroring
+  `assets.enabled`). `change_detection` writes the datapoint only when its
+  `value` differs from the last published value; the first reading after
+  start, and after every new settings row of the datapoint, is the baseline.
+  Without a row both are off: full snapshots.
+- **demo_value / demo_variance** — what demo mode should produce for this
+  datapoint, so synthetic data is plausible in context (a temperature sits at
+  75 °C ±2, not a random 0–100). `demo_value` is the value the reading sits
+  at, in **engineering units** — adapters must not apply their
   raw-to-engineering `scale` on top of it; `demo_variance` is how far it may
   wander (± , same units; `0` pins it to a constant). A boolean `demo_value`
   instead gives a state resting there, with `demo_variance` as the per-sample
-  chance of blipping out of it. Both null = the historical 0–100 range. Also
-  user-owned and preserved across re-discovery, and read live from the catalog,
-  so board edits apply on the next cycle. See [Demo mode](#demo-mode).
-- **measurements.data** — `{datapoint_id: {name, units, value, ...extras}}`.
-  Rows are **snapshots**: each row carries the asset's full current state
-  (push protocols merge last-known values per window); changes-only rows are
-  an explicit opt-in, either protocol-level or per datapoint via
+  chance of blipping out of it. Per column the settings value wins when it is
+  not null, then the catalog's default, then the adapter's resolved dict; all
+  null = the 0–100 range. See [Demo mode](#demo-mode).
+
+### measurements
+
+- **data** — `{datapoint_id: {name, units, value, ...extras}}`. Rows are
+  **snapshots**: each row carries the asset's full current state (push
+  protocols merge last-known values per window); changes-only rows are an
+  explicit opt-in, either protocol-level or per datapoint via
   `change_detection`/`enabled` (then rows are partial — only the datapoints
   that passed the gate). Well-known optional extras: `status`,
   `status_flags`, `source_tsp`, `description`. Soft limit ~500 datapoints
   per asset — beyond that, filter via datapoint_spec or split assets.
-- **assetstatus** — written by the core on transitions only:
-  `online` (first successful publish), `offline` (collection error, with
-  error text in `detail`), `paused` (enabled=false). Latest row = current
-  state; history = availability log.
-- **gateways.store_data** — `false` switches the app to forward-only mode:
-  configuration is still read live, but measurements/datapoints/assetstatus
-  are not written. Config writes (gateway registry, asset auto-registration)
-  remain active.
-- **gateways rows are echo-merged**: the core re-appends the existing row's
-  columns at startup so user-edited settings survive the registry write.
-- **The config tables are followed subscribe-first.** For `gateways`,
-  `datapoints` and `assets` the core subscribes, then reads the current rows
-  with the SDK's `{"latest": True}` marker (the physical `latest_flag` column no
-  longer exists), so a row saved during startup is not lost. Every row, read or
-  delivered, is applied only when its `tsp` is newer than the last row applied
-  for that entity (rows within 1 ms count as the same row: a read returns epoch
-  milliseconds, an event ISO text), so an older read never undoes a newer edit
-  and a deleted datapoint is never revived. `deleted` is null-safe like
-  `enabled`: only an explicit `true` deletes, so rows a board form wrote without
-  the flag are live. Rows of one asset are applied one at a time under a
-  per-asset lock, so a slow discovery for a stale row cannot override a later
-  edit. (Up to v2.9.0 the core read first, filtered on `latest_flag`, and
-  skipped rows whose `deleted` was NULL at startup.)
+
+### assetstatus
+
+Written by the core on transitions only: `online` (first successful
+publish), `offline` (collection error, with error text in `detail`), `paused`
+(enabled=false). Latest row = current state; history = availability log.
+
+### Following the board-written tables
+
+`gateway_settings`, `assets` and `datapoint_settings` are followed
+subscribe-first: the core subscribes, then reads the current rows with the
+SDK's `{"latest": True}` marker (`gateway_settings` and `datapoint_settings`
+filtered on `gateway_id = DEVICE_KEY`), so a row saved during startup is not
+lost. Every row, read or delivered, is applied only when it belongs to this
+gateway and its `tsp` is newer than the last row applied for that entity
+(rows within 1 ms count as the same row: a read returns epoch milliseconds,
+an event ISO text), so an older read never undoes a newer edit. `deleted` is
+null-safe like `enabled`: only an explicit `true` deletes, so rows a board
+form wrote without the flag are live. Rows of one asset are applied one at a
+time under a per-asset lock, so a slow discovery for a stale row cannot
+override a later edit. After applying a row the core requests a refresh of
+the transforms mapped to that table (see
+[Refreshing the app's transforms](#refreshing-the-apps-transforms)).
+
+### Writing
+
 - **Rows are made storable before they are buffered.** Measurements and
   assetstatus share one bounded buffer, and a row the platform cannot carry
   (a lone surrogate from a JSON escape, NaN/Infinity, an integer outside
-  64 bits, a set or other object) used to stay at its head and block every
+  64 bits, a set or other object) would stay at its head and block every
   asset's writes. `collector_core.storable` repairs such values instead of
   dropping the row — bad code points are escaped, non-finite floats become
   null, the rest become text — and the core reports the repair as a warning
@@ -115,31 +192,20 @@ Key semantics:
   one waits behind it for the rows appended meanwhile. The SDK
   (ironflock >= 1.9) holds a table write for up to its `reconnect_window`
   (60 s) while the link is down, and an asset's collection loop waiting for
-  that would take one reading a minute during an outage. (Up to v2.7.2 the
-  drain ran inline.)
+  that would take one reading a minute during an outage.
 - **A cancelled caller never takes buffered rows with it.** The drain is not
   part of the asset's collection task, which an app cancels whenever it
   reconfigures that asset (every row edit), and the flush loop's drain runs
   shielded: the rows a drain took out of the shared buffer - every asset's -
-  are written once, or re-queued if the write fails. (Up to v2.7.1 they were
-  lost; putting them back instead could write a chunk twice.)
+  are written once, or re-queued if the write fails.
 - **Latest entity rows are kept alive.** Table retention (`dropAfter`) drops
   whole chunks, the latest row of an entity included, so a datapoint or an
-  asset status that never changes would age out — and with it the user's
-  per-datapoint settings. Every `REASSERT_INTERVAL` (6 h) the core rewrites
-  the full latest `datapoints` rows and `assetstatus` rows it owns that are
-  older than `Collector.reassert_after` (default 7 days). Keep every app's
-  `dropAfter` for those tables far above that. `assets` rows are not
-  rewritten (a rewrite restarts the asset's task); the template keeps them
-  for 3 years.
-- **gateways.url** — remote-access URLs for the gateway, written by the core at
-  registration when the app declares ports (see below). A JSON object **keyed by
-  the port number** (string) → `{name, protocol, main, url}`, one entry per
-  declared port, where `url` is the ready-to-use absolute tunnel URL (directly
-  embeddable as an iframe `src`) or null while the tunnel/identity is
-  unavailable. Keyed so the frontend can look a port up directly. Derived and
-  core-owned: recomputed from the live tunnel/identity each startup rather than
-  echo-merged. Absent when the app declares no ports.
+  asset status that never changes would age out. Every `REASSERT_INTERVAL`
+  (6 h) the core rewrites the full latest `datapoints` rows and `assetstatus`
+  rows it owns that are older than `Collector.reassert_after` (default 7
+  days). Keep every app's `dropAfter` for those tables far above that. The
+  board-written tables are not rewritten: `assets` is kept for 3 years, and
+  `gateways`, `gateway_settings` and `datapoint_settings` have no `dropAfter`.
 - **Secrets never go into tables** (boards can read them). Credentials and
   certificates come from device environment or mounted volumes; tables hold
   only non-secret configuration.
@@ -158,7 +224,7 @@ Key semantics:
 | `create_session(asset)` | abstract | Create the per-asset session. **No I/O in constructors** — sessions are also created in demo mode |
 | `format_value(asset, datapoint, raw)` | abstract | Raw protocol value → scalar for `value` |
 | `make_entry(asset, datapoint, raw)` | overridable | Build the full measurements entry; the hook for per-reading quality/timestamps and live metadata |
-| `apply_settings(gateway_row)` | overridable | Consume gateway-level settings columns; called before asset configuration and on live row changes |
+| `apply_settings(settings_row)` | overridable | Consume this gateway's `gateway_settings` row (`{}` without one); called before asset configuration and on every newer row |
 | `start_background(collector)` | overridable | Spawn protocol background work (network discovery that auto-registers asset rows) |
 
 ### ProtocolSession (one per asset task)
@@ -193,7 +259,8 @@ Stream contract details:
 `assets.demo_mode` makes an asset produce synthetic data instead of reading a
 device, so names, units, dashboards and alarm limits can be checked before the
 hardware is reachable. The core paces it (`stream` is never called) and shapes
-the values from the two per-datapoint columns above.
+the values from the effective `demo_value` / `demo_variance` of each datapoint
+(see [datapoint_settings](#datapoint_settings)).
 
 `collector_core.demo.DemoSignal` turns them into a **mean-reverting random
 walk**: each sample steps from the previous one and is pulled back towards
@@ -300,7 +367,50 @@ Resolution is best-effort and never blocks registration. Using this feature requ
 development run's `-dev` URL (older SDKs return the PROD install's URL there);
 apps that declare no ports are unaffected and keep the old minimum.
 
-Between 2.7.0 and this change the core copied the SDK's tunnel rules to fill an
-extra `appliance` scope. The copy fell behind the SDK (no `-dev` suffix, so a
-dev run's board embedded the PROD install), and the SDK exposes no appliance
-route, so that scope is gone.
+## Refreshing the app's transforms
+
+An app's board often shows a transform (a view in its data-template) over the
+core's tables, such as a count of the assets per state over `assetstatus`. A
+transform reaches the board on its `schedule` tick, or at once when the app's
+code calls the SDK's `refresh_transform` (ironflock >= 1.11.0). The app maps
+each table to the transforms that read it, in bottom-up order (a transform
+before the transforms that read it):
+
+```python
+collector = Collector(
+    device_name=DEVICE_NAME,
+    device_key=DEVICE_KEY,
+    adapter=MyAdapter(),
+    refresh_transforms={
+        "assetstatus": ["asset_status_counts", "asset_overview"],
+        "assets": ["asset_overview"],
+        "gateways": ["gateway_overview"],
+    },
+)
+```
+
+The core requests a refresh of a table's transforms:
+
+- after it writes the table: each chunk a drain of the outbound buffer wrote
+  (measurements, assetstatus), each `DatapointStore.upsert` / `prune` that
+  wrote catalog rows, the registration row, the keep-alive's rewrites;
+- after it applies a row of its own gateway from a followed table (`assets`,
+  `gateway_settings`, `datapoint_settings`): the container that follows a
+  board-written table refreshes once it applied the change.
+
+With `store_data` false no data rows are written, so only the registration
+and the applied rows refresh. An adapter that writes a table of its own (the
+IO-Link adapter's `iodds`) maps it in `refresh_transforms` and calls
+`collector.request_refresh("iodds")` after its writes.
+
+`request_refresh` returns at once; the refreshes run as background tasks,
+never inside collection or `_send`. A table's list is refreshed one transform
+after the other, in its order. Requests coalesce: per table one pass over its
+list runs and one more waits for the requests made meanwhile; per transform
+one refresh is in flight and one waits, and two refreshes of the same
+transform are at least `REFRESH_MIN_INTERVAL` (2 s) apart, so a mapping
+driven by `measurements` cannot hammer the data backend. A refresh refused
+with `URI_REFRESH_IN_PROGRESS` (a scheduled refresh holds the view) is retried
+once after 2 s; any other failure is printed, never raised, and the
+transform's schedule still runs. With an SDK that has no `refresh_transform`
+nothing is refreshed, and the core says so once.

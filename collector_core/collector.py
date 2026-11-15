@@ -1,15 +1,17 @@
 """Protocol-agnostic collector core.
 
-Owns everything that is identical regardless of the wire protocol: loading
-gateway settings and asset/datapoint configuration from IronFlock,
-subscribing to live config changes, managing one collection task per asset
-(paced polling or protocol-pushed streams), assembling the ``measurements``
-payload, tracking asset online/offline/paused state in ``assetstatus``, and
-writing to IronFlock. All protocol specifics are delegated to an injected
-``ProtocolAdapter`` (see ``collector_core.adapter``).
+Owns everything that is identical regardless of the wire protocol: registering
+the gateway, following the board-written configuration tables
+(``gateway_settings``, ``assets``, ``datapoint_settings``) subscribe-first,
+managing one collection task per asset (paced polling or protocol-pushed
+streams), keeping the ``datapoints`` catalog, assembling the ``measurements``
+payload, tracking asset online/offline/paused state in ``assetstatus``,
+writing to IronFlock, and refreshing the app's transforms after its writes.
+All protocol specifics are delegated to an injected ``ProtocolAdapter`` (see
+``collector_core.adapter``).
 
 Data writes (measurements, datapoints, assetstatus) can be disabled per
-gateway via the ``store_data`` column for forward-only deployments;
+gateway via the ``store_data`` setting for forward-only deployments;
 configuration is still read live from the platform.
 """
 
@@ -33,7 +35,7 @@ from collector_core.errors import CollectorError
 from collector_core.storable import storable
 
 # Max data rows buffered locally while the cloud link is down, when the
-# gateway row sets no buffer_size. Oldest rows are dropped on overflow.
+# gateway_settings row sets no buffer_size. Oldest rows are dropped on overflow.
 DEFAULT_BUFFER_SIZE = 10000
 
 # How often the background flusher retries draining the buffer (seconds).
@@ -49,9 +51,8 @@ _UNSET = object()
 
 # Keeping entity rows alive. Table retention (dropAfter) drops whole chunks,
 # the latest row of an entity included, so a catalog row or an asset status
-# that never changes ages out of its table: the board loses the datapoint and
-# the user's per-datapoint pause / change-detection choice with it. The core
-# rewrites the latest datapoints and assetstatus rows it owns once they are
+# that never changes ages out of its table and the board loses the datapoint.
+# The core rewrites the latest datapoints and assetstatus rows it owns once they are
 # older than REASSERT_AFTER (seconds), checking every REASSERT_INTERVAL. Both
 # must stay far below the shortest dropAfter an app gives those tables (the
 # core template uses 3 months).
@@ -75,6 +76,16 @@ SAME_ROW_WINDOW = 0.001
 # derives it from the table's maintainLatestFlagFor columns). The former
 # physical latest_flag column no longer exists.
 LATEST = {"latest": True}
+
+# Refreshing the app's transforms after the core writes a table they read
+# (see Collector.request_refresh). Two refreshes of one transform are at least
+# REFRESH_MIN_INTERVAL seconds apart, so a mapping driven by measurements
+# cannot hammer the data backend. A refresh refused with
+# URI_REFRESH_IN_PROGRESS (a scheduled refresh holds the view) is retried once
+# after REFRESH_RETRY_DELAY seconds.
+REFRESH_MIN_INTERVAL = 2.0
+REFRESH_RETRY_DELAY = 2.0
+REFRESH_IN_PROGRESS = "URI_REFRESH_IN_PROGRESS"
 
 
 def _now():
@@ -141,9 +152,46 @@ def outage_cause(exc):
     return "link down"
 
 
+class _TransformRefresh:
+    """Refresh bookkeeping of one transform (see ``Collector.request_refresh``).
+
+    ``requested`` counts the requests, ``completed`` is the request count the
+    last finished refresh covered: a refresh that starts after a request
+    covers it. One worker task at a time runs the refreshes, so at most one is
+    in flight and the requests made meanwhile wait as one more refresh.
+    """
+
+    __slots__ = ("changed", "completed", "last", "requested", "worker")
+
+    def __init__(self):
+        self.requested = 0
+        self.completed = 0
+        self.last = None  # monotonic end of the last refresh
+        self.worker = None
+        self.changed = asyncio.Condition()
+
+
+def _transform_lists(mapping):
+    """``refresh_transforms`` as {table: [transform, ...]}; a single name may
+    be given as a string."""
+    lists = {}
+    for table, names in (mapping or {}).items():
+        if isinstance(names, str):
+            names = [names]
+        lists[table] = [name for name in names if name]
+    return lists
+
+
 class Collector:
     def __init__(
-        self, device_name, device_key, adapter, store_data=True, on_error=None, ports=None
+        self,
+        device_name,
+        device_key,
+        adapter,
+        store_data=True,
+        on_error=None,
+        ports=None,
+        refresh_transforms=None,
     ):
         self.device_name = device_name
         self.device_key = device_key
@@ -160,27 +208,37 @@ class Collector:
         # (local / cloud) and written to the gateway row's ``url``
         # column at registration so boards can list/embed a gateway's web UIs
         # (iframe src) — consumers pick a scope explicitly. Empty (the default)
-        # leaves the ``url`` column untouched. Use
+        # leaves the ``url`` column out. Use
         # ``Collector.load_ports_from_template()`` to read them from the template.
         self.ports = list(ports) if ports else []
-        # App-provided extra gateway columns, merged into every gateway
-        # registration (register_gateway). Lets an app publish custom columns
-        # it declared in its data-template (e.g. a cluster role) without
-        # fighting the core's echo of existing row values. Core-owned columns
-        # (gateway_name, deleted, info, url, tsp) always win over these.
+        # App-provided extra gateway columns, merged into the registration row
+        # (register_gateway), e.g. a cluster role the app declared in its
+        # data-template. Core-owned columns (gateway_id, gateway_name, info,
+        # url, deleted, tsp) always win over these.
         self.gateway_extra: dict = {}
-        # Default when the gateway row has no store_data column. With
+        # The app's transforms (views in its data-template) to refresh after
+        # the core writes, or applies a row of, a table they read:
+        # {table: [transform, ...]}, each list in bottom-up order (a transform
+        # before the ones that read it). Needs ironflock >= 1.11.0 for
+        # refresh_transform; see request_refresh.
+        self.refresh_transforms = _transform_lists(refresh_transforms)
+        # Default when the gateway_settings row has no store_data value. With
         # store_data False, configuration is still read live from the
         # platform but collected data is not written to it.
         self._default_store_data = store_data
         self.store_data = store_data
         self.ironflock = None
         self.store = None
-        self.gateway = {}
-        # The live datapoints catalog (kept in sync by the table subscription
-        # and the store). Read per publish to gate writes by the user-set
-        # ``enabled`` / ``change_detection`` columns.
+        # This gateway's row of gateway_settings in force ({} until the board
+        # writes one).
+        self.settings: dict = {}
+        # The datapoints catalog the core writes (through the store), read at
+        # startup. Shared with the store, which keeps it current.
         self.datapoints: list[dict] = []
+        # The user's per-datapoint switches from datapoint_settings, keyed
+        # (asset_name, datapoint_id): enabled, change_detection and the demo
+        # tuning. Read per publish to gate writes and shape demo values.
+        self.datapoint_settings: dict[tuple, dict] = {}
         self.asset_tasks: dict[str, asyncio.Task] = {}
         self._asset_status: dict[str, str] = {}
         # Last value published per (asset_name, datapoint_id) for change
@@ -206,6 +264,8 @@ class Collector:
         self._status_written: dict[str, tuple] = {}
         # (asset, table, repairs) -> monotonic time of its last report.
         self._repair_reported: dict[tuple, float] = {}
+        # Incomplete asset rows (no name or no gateway) already reported.
+        self._incomplete_reported: set = set()
         # Overridable per instance (tests, apps with an unusually short
         # dropAfter); see REASSERT_AFTER.
         self.reassert_after = REASSERT_AFTER
@@ -215,6 +275,15 @@ class Collector:
         # One lock per asset name: configuring an asset awaits discovery, and
         # two rows of the same asset must not be applied out of order.
         self._asset_locks: dict[str, asyncio.Lock] = {}
+        # Transform refreshes (see request_refresh): per transform its
+        # bookkeeping, per table whether a refresh of its list runs and
+        # whether another was requested meanwhile, and the background tasks,
+        # held until they end (the loop keeps tasks only weakly).
+        self._transform_refresh: dict[str, _TransformRefresh] = {}
+        self._table_refresh_running: set = set()
+        self._table_refresh_pending: set = set()
+        self._refreshing: set = set()
+        self._refresh_unsupported_reported = False
 
     def set_ironflock(self, ironflock):
         """Provide the IronFlock handle used for all table I/O. Must be called
@@ -287,16 +356,17 @@ class Collector:
         return True
 
     def _is_own(self, row):
-        """Whether a row of assets or datapoints belongs to this gateway."""
+        """Whether a row of a per-gateway table (gateway_settings, assets,
+        datapoints, datapoint_settings) belongs to this gateway."""
         gateway_id = row.get("gateway_id")
         try:
             return gateway_id is not None and int(gateway_id) == self.device_key
         except (TypeError, ValueError):
             return False
 
-    # ----------------------------------------------------------------- gateway
+    # ------------------------------------------------------- gateway settings
 
-    def _apply_gateway_row(self, row):
+    def _apply_settings_row(self, row):
         value = row.get("store_data")
         self.store_data = self._default_store_data if value is None else bool(value)
         if self.store is not None:
@@ -314,42 +384,70 @@ class Collector:
             # Resize, keeping the newest rows (deque drops the oldest overflow).
             self._buffer = deque(self._buffer, maxlen=size)
 
-    def _take_gateway_row(self, row):
-        """Make ``row`` this gateway's settings if it is this gateway's and
-        newer than the row in force. Returns whether it was taken."""
-        if row.get("gateway_name") != self.device_name:
+    def _take_settings_row(self, row):
+        """Make ``row`` this gateway's settings if it is this gateway's row of
+        ``gateway_settings`` and newer than the row in force. Returns whether
+        it was taken."""
+        if not self._is_own(row):
             return False
-        if not self._is_newer("gateways", self.device_name, row):
+        if not self._is_newer("gateway_settings", self.device_key, row):
             return False
-        self.gateway = row
-        self._apply_gateway_row(row)
+        self.settings = row
+        self._apply_settings_row(row)
+        self.request_refresh("gateway_settings")
         return True
 
-    async def load_gateway(self):
-        """Load this gateway's own row (registry + per-gateway settings).
+    async def load_gateway_settings(self):
+        """Follow ``gateway_settings``: subscribe, then read this gateway's
+        current row.
 
-        Call it after subscribing to ``gateways``: a row the subscription
-        already applied is newer than or the same as the one read here, and
-        the read does not replace it."""
+        The board writes the row; a row the subscription already applied is
+        newer than or the same as the one read here, and the read does not
+        replace it. Without a row the defaults apply (``store_data`` from the
+        constructor, ``DEFAULT_BUFFER_SIZE``). The adapter's
+        ``apply_settings`` is called by ``run`` after this, and by the
+        subscription on every later row."""
+        await self.ironflock.subscribe_to_table(
+            "gateway_settings", self._handle_settings_update()
+        )
         rows = await self.ironflock.getHistory(
-            "gateways",
+            "gateway_settings",
             {
                 "limit": 1,
                 "filterAnd": [
                     LATEST,
-                    {
-                        "column": "gateway_name",
-                        "operator": "=",
-                        "value": self.device_name,
-                    },
+                    {"column": "gateway_id", "operator": "=", "value": self.device_key},
                 ],
             },
         )
         if rows:
-            self._take_gateway_row(rows[-1])
-        else:
-            self._apply_gateway_row(self.gateway)
-        print(f"Gateway settings: {self.gateway}")
+            self._take_settings_row(rows[-1])
+        if not self.settings:
+            self._apply_settings_row({})
+        print(f"Gateway settings: {self.settings}")
+
+    def _handle_settings_update(self):
+        async def handler(*args, **kwargs):
+            row = args[0] if args else {}
+            if not self._take_settings_row(row):
+                return
+            print("Gateway settings updated:", row)
+            await self._apply_adapter_settings(self.settings)
+
+        return handler
+
+    async def _apply_adapter_settings(self, row):
+        try:
+            await self.adapter.apply_settings(row)
+        except Exception as e:
+            print(f"apply_settings failed, using adapter defaults: {e}")
+            await self.report_exception(
+                e,
+                level="warn",
+                fallback_user_message="Gateway settings could not be applied; using defaults.",
+            )
+
+    # ---------------------------------------------------------------- gateway
 
     @staticmethod
     def load_ports_from_template(path=".ironflock/port-template.yml"):
@@ -467,46 +565,32 @@ class Collector:
             return None
 
     async def register_gateway(self):
-        """Write the registry row, echoing existing columns so user-edited
-        gateway settings survive the startup append (the appended row becomes
-        the latest one). When the app declared remote-access ports, their
-        resolved access scopes (local/cloud) are (re)written to the
-        ``url`` column. App-provided ``gateway_extra`` columns are merged in
-        before the core-owned fields, so the core always wins on those."""
-        payload = {
-            k: v for k, v in self.gateway.items() if k not in PLATFORM_COLUMNS
-        }
-        payload.update(self.gateway_extra)
+        """Write this gateway's row of ``gateways``: the gateway registers
+        itself, keyed by ``gateway_id`` (its DEVICE_KEY).
+
+        The row is ``{tsp, gateway_id, gateway_name, info, url, deleted:
+        False}``, ``url`` only when the app declared remote-access ports
+        (recomputed from the live tunnel/identity on every start). App-provided
+        ``gateway_extra`` columns are merged in first, so the core-owned
+        columns win. ``deleted: False`` brings back a gateway a user deleted
+        on the board, since it runs again. Nothing of an earlier row is
+        echoed: the board writes only delete rows to this table, and the
+        user's settings live in ``gateway_settings``."""
+        payload = dict(self.gateway_extra)
+        payload["gateway_id"] = self.device_key
         payload["gateway_name"] = self.device_name
-        payload["deleted"] = False
         payload["info"] = {
             "app_started": _now(),
             "python": sys.version.split()[0],
         }
-        # Derived, core-owned: recompute from the live tunnel/identity rather than
-        # echoing a stale value forward.
         if self.ports:
             payload["url"] = self._resolve_remote_access_urls()
+        else:
+            payload.pop("url", None)
+        payload["deleted"] = False
         payload["tsp"] = _now()
         await self.ironflock.append_to_table("gateways", payload)
-
-    def _handle_gateway_update(self):
-        async def handler(*args, **kwargs):
-            row = args[0] if args else {}
-            if not self._take_gateway_row(row):
-                return
-            print("Gateway settings updated:", row)
-            try:
-                await self.adapter.apply_settings(row)
-            except Exception as e:
-                print(f"apply_settings failed: {e}")
-                await self.report_exception(
-                    e,
-                    level="warn",
-                    fallback_user_message="Gateway settings could not be applied; using defaults.",
-                )
-
-        return handler
+        self.request_refresh("gateways")
 
     # ------------------------------------------------------------------ status
 
@@ -552,22 +636,6 @@ class Collector:
 
     # ------------------------------------------------------------------ config
 
-    async def soft_delete_asset(self, asset):
-        """Append a deleted record to soft-delete an invalid asset config.
-
-        Echoes the original row's columns back with deleted=True and a fresh
-        tsp, so it becomes the entity's current row (matched by its key).
-        """
-        payload = {
-            k: v
-            for k, v in asset.items()
-            if k not in PLATFORM_COLUMNS and k != "datapoint_list"
-        }
-        payload["deleted"] = True
-        payload["tsp"] = _now()
-        print(f"Soft-deleting invalid asset config: {payload}")
-        await self.ironflock.append_to_table("assets", payload)
-
     @staticmethod
     def _is_enabled(asset):
         # Null-safe pause switch: only an explicit false pauses the asset, so
@@ -600,19 +668,25 @@ class Collector:
         Subscribing first means no row saved during the read is lost; each row
         goes through :meth:`_apply_asset_row`, which applies only rows newer
         than the one in force. A row whose ``deleted`` is NULL is a live asset
-        (board forms and older rows leave the flag out)."""
+        (board forms and older rows leave the flag out).
+
+        The core never writes ``assets`` (the board and the AI assistant do).
+        An incomplete row, without a name or a gateway, is skipped and
+        reported once (:meth:`_skip_incomplete_asset`); the user deletes it on
+        the board. For an asset deleted while the gateway was not running, the
+        catalog rows still in force are soft-deleted here."""
         configured_assets = []
         await self.ironflock.subscribe_to_table(
             "assets", self._handle_asset_update(configured_assets)
         )
-        # No gateway_id filter here: we need to see invalid/orphaned rows
-        # (empty asset_name or null gateway_id) so we can clean them up.
-        # Configuration is scoped to this device's gateway in the loop below.
+        # No gateway_id filter: rows without a gateway are reported too.
+        # Configuration is scoped to this gateway in the loop below.
         rows = await self.ironflock.getHistory(
             "assets", {"limit": 1000, "filterAnd": [LATEST]}
         )
-        result = [row for row in rows or [] if not row.get("deleted")]
-        if not result:
+        live = [row for row in rows or [] if not row.get("deleted")]
+        own = [row for row in live if self._is_own(row)]
+        if not own:
             print(
                 "No assets found in the assets table. Please add asset configurations first."
             )
@@ -621,35 +695,48 @@ class Collector:
                 level="info",
                 user_message="No assets configured yet — add an asset configuration to start collecting.",
             )
-        print(f"Loaded {len(result)} asset(s) from assets table")
+        print(f"Loaded {len(own)} asset(s) from assets table")
 
-        for asset in result:
-            asset_name = (asset.get("asset_name") or "").strip()
-            gateway_id = asset.get("gateway_id")
-
-            # Clean up invalid configs: empty asset name or no gateway assignment.
-            if not asset_name or gateway_id is None:
-                try:
-                    await self.soft_delete_asset(asset)
-                    await self.report_error(
-                        f"removed invalid asset config (asset_name={asset_name!r}, "
-                        f"gateway_id={gateway_id!r})",
-                        level="warn",
-                        user_message=(
-                            f"An incomplete asset configuration"
-                            f"{f' ({asset_name!r})' if asset_name else ''} was removed — "
-                            "it was missing a name or gateway assignment."
-                        ),
-                    )
-                except Exception as e:
-                    print(f"Failed to soft-delete invalid asset: {e}")
+        for asset in live:
+            if await self._skip_incomplete_asset(asset):
                 continue
-
-            # Only configure assets assigned to this device's gateway.
             if self._is_own(asset):
                 await self._apply_asset_row(asset, configured_assets)
 
+        for asset in rows or []:
+            name = (asset.get("asset_name") or "").strip()
+            if asset.get("deleted") and name and self._is_own(asset):
+                await self._delete_catalog(name)
+
         return configured_assets
+
+    async def _skip_incomplete_asset(self, asset):
+        """Whether ``asset`` is an incomplete row to skip: no ``gateway_id``,
+        or this gateway's row without an ``asset_name``. Each one is reported
+        once (warn); rows of other gateways are theirs to report. Deleted rows
+        are never reported."""
+        name = (asset.get("asset_name") or "").strip()
+        gateway_id = asset.get("gateway_id")
+        if gateway_id is not None and name:
+            return False
+        if gateway_id is not None and not self._is_own(asset):
+            return True
+        if asset.get("deleted"):
+            return True
+        key = (str(gateway_id), name)
+        if key in self._incomplete_reported:
+            return True
+        self._incomplete_reported.add(key)
+        await self.report_error(
+            f"skipped incomplete asset row (asset_name={name!r}, gateway_id={gateway_id!r})",
+            level="warn",
+            user_message=(
+                f"An asset configuration{f' ({name!r})' if name else ''} is incomplete: "
+                f"it has no {'gateway' if gateway_id is None else 'name'}, so it is not "
+                "collected. Complete it or delete it on the board."
+            ),
+        )
+        return True
 
     def _asset_lock(self, asset_name):
         lock = self._asset_locks.get(asset_name)
@@ -664,7 +751,9 @@ class Collector:
         Rows of one asset are applied one at a time, in the order they win the
         lock, and an older row that waited behind a newer one is dropped, so a
         slow discovery for a stale row can never override a later edit.
-        Returns whether the row was applied; never raises."""
+        A deleting row also soft-deletes the asset's catalog rows and its
+        status. An applied row requests a refresh of the transforms over
+        ``assets``. Returns whether the row was applied; never raises."""
         asset_name = asset.get("asset_name")
         if not asset_name:
             return False
@@ -679,6 +768,8 @@ class Collector:
                     await self.clear_asset_status(asset)
                 except Exception as e:
                     print(f"Failed to clear status of {asset_name}: {e}")
+                await self._delete_catalog(asset_name)
+                self.request_refresh("assets")
                 return True
             print(f"Configuring asset: {asset_name}")
             try:
@@ -691,30 +782,38 @@ class Collector:
                     asset_name=asset_name,
                     fallback_user_message=f"'{asset_name}' has an invalid configuration.",
                 )
+            self.request_refresh("assets")
             return True
+
+    async def _delete_catalog(self, asset_name):
+        """Soft-delete a deleted asset's ``datapoints`` rows. The core is the
+        catalog's only writer; with ``store_data`` False nothing is written,
+        as for every catalog write. Never raises."""
+        if self.store is None:
+            return
+        try:
+            await self.store.prune(asset_name, [])
+        except Exception as e:
+            print(f"Failed to delete the datapoints of {asset_name}: {e}")
 
     def _handle_asset_update(self, assets):
         async def handler(*args, **kwargs):
             asset = args[0] if args else {}
+            if await self._skip_incomplete_asset(asset):
+                return
             if not self._is_own(asset):
-                print(f"Received asset update for gateway_id {asset.get('gateway_id')}, ignoring")
                 return
             await self._apply_asset_row(asset, assets)
 
         return handler
 
     async def load_datapoints(self):
-        """Follow the datapoints table: subscribe, then read this gateway's
-        current rows into the catalog.
+        """Read this gateway's current ``datapoints`` catalog rows.
 
-        The subscription, the returned list and the store share ONE list
-        object, so the live updates, the store and the collector's gating stay
-        in sync. Rows go through :meth:`_apply_datapoint_row` either way, which
-        applies only rows newer than the one in force."""
+        The core is the catalog's only writer, so the table is read once at
+        startup and not followed: the store keeps the returned list current
+        as it writes. The returned list object is shared with the store."""
         datapoints: list[dict] = []
-        await self.ironflock.subscribe_to_table(
-            "datapoints", self._handle_datapoint_update(datapoints)
-        )
         rows = await self.ironflock.getHistory(
             "datapoints",
             {
@@ -736,7 +835,7 @@ class Collector:
         return datapoints
 
     def _apply_datapoint_row(self, datapoints, row):
-        """Put one of this gateway's datapoint rows into the catalog if it is
+        """Put one of this gateway's catalog rows into ``datapoints`` if it is
         newer than the row in force; a deleted row (``deleted`` true) removes
         the datapoint, a NULL flag keeps it. Returns whether it was applied."""
         if not self._is_own(row):
@@ -753,14 +852,56 @@ class Collector:
             datapoints.append(row)
         return True
 
-    def _handle_datapoint_update(self, datapoints):
+    # ----------------------------------------------------- datapoint settings
+
+    async def load_datapoint_settings(self):
+        """Follow ``datapoint_settings``: subscribe, then read this gateway's
+        current rows into ``self.datapoint_settings``.
+
+        The board and the AI assistant write these rows (the user's
+        per-datapoint switches); each goes through
+        :meth:`_apply_datapoint_settings_row`, which applies only rows newer
+        than the one in force."""
+        await self.ironflock.subscribe_to_table(
+            "datapoint_settings", self._handle_datapoint_settings_update()
+        )
+        rows = await self.ironflock.getHistory(
+            "datapoint_settings",
+            {
+                "limit": 3000,
+                "filterAnd": [
+                    LATEST,
+                    {"column": "gateway_id", "operator": "=", "value": self.device_key},
+                ],
+            },
+        )
+        for row in rows or []:
+            self._apply_datapoint_settings_row(row)
+        print(f"Loaded {len(self.datapoint_settings)} datapoint setting(s)")
+        return self.datapoint_settings
+
+    def _apply_datapoint_settings_row(self, row):
+        """Take one of this gateway's ``datapoint_settings`` rows if it is
+        newer than the row in force for its datapoint. The next reading of the
+        datapoint is a new change-detection baseline. Requests a refresh of
+        the transforms over the table. Returns whether it was applied."""
+        if not self._is_own(row):
+            return False
+        key = (row.get("asset_name"), row.get("datapoint_id"))
+        if not key[0] or not key[1]:
+            return False
+        if not self._is_newer("datapoint_settings", key, row):
+            return False
+        self.datapoint_settings[key] = row
+        self._last_values.pop(key, None)
+        self.request_refresh("datapoint_settings")
+        return True
+
+    def _handle_datapoint_settings_update(self):
         def handler(*args, **kwargs):
             row = args[0] if args else {}
-            if not self._is_own(row):
-                print(f"Received datapoint update for gateway_id {row.get('gateway_id')}, ignoring")
-                return
-            if self._apply_datapoint_row(datapoints, row):
-                print("Updated datapoints with row:", row)
+            if self._apply_datapoint_settings_row(row):
+                print("Datapoint settings updated:", row)
 
         return handler
 
@@ -860,7 +1001,8 @@ class Collector:
         one. A reconnect after a long outage then catches up in a handful of
         bulk requests instead of thousands of single-row ones. Stops at the
         first failure, re-queuing the un-sent rows oldest-first so the backlog
-        (and ordering) is preserved.
+        (and ordering) is preserved. Every chunk written requests a refresh of
+        the transforms over its table (``request_refresh``, which never waits).
         """
         async with self._flush_lock:
             # Rows appended from here on need a drain of their own.
@@ -887,6 +1029,7 @@ class Collector:
                     self._link_down = True
                     print(f"buffered {len(self._buffer)} row(s); {outage_cause(e)}: {e}")
                     return
+                self.request_refresh(table)
                 i = j
 
             # Backlog fully drained after an outage: tell the operator once,
@@ -911,6 +1054,120 @@ class Collector:
                         level="info",
                         user_message="Connection restored — all buffered readings were delivered.",
                     )
+
+    # ------------------------------------------------------- transform refresh
+
+    def request_refresh(self, table):
+        """Refresh the app's transforms that read ``table``, in the background.
+
+        ``refresh_transforms`` maps a table to its transforms in bottom-up
+        order; they are refreshed one after the other with the SDK's
+        ``refresh_transform`` (ironflock >= 1.11.0), so a board bound to them
+        shows the change at once instead of at the transform's schedule tick.
+        The core calls this after it writes a table (a drained chunk, a
+        catalog write, the registration, the keep-alive) and after it applies
+        a row of its own gateway from a followed table (assets,
+        gateway_settings, datapoint_settings). An adapter calls it after
+        writing a table of its own.
+
+        Returns at once; call it from the event loop. Requests coalesce: per
+        table one refresh of its list runs and one more waits for the requests
+        made meanwhile; per transform one refresh is in flight and one waits,
+        and two refreshes of a transform are at least REFRESH_MIN_INTERVAL
+        seconds apart. A refresh refused with URI_REFRESH_IN_PROGRESS is
+        retried once after REFRESH_RETRY_DELAY seconds; every other failure is
+        printed, never raised. An SDK without refresh_transform refreshes
+        nothing (printed once).
+        """
+        names = self.refresh_transforms.get(table)
+        if not names or self.ironflock is None:
+            return
+        if getattr(self.ironflock, "refresh_transform", None) is None:
+            if not self._refresh_unsupported_reported:
+                self._refresh_unsupported_reported = True
+                print(
+                    "refresh_transforms is set, but this ironflock SDK has no "
+                    "refresh_transform (needs >= 1.11.0); transforms follow their schedule"
+                )
+            return
+        if table in self._table_refresh_running:
+            self._table_refresh_pending.add(table)
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            print(f"refresh of the transforms over {table} skipped: no running event loop")
+            return
+        self._table_refresh_running.add(table)
+        self._hold(asyncio.ensure_future(self._refresh_table(table)))
+
+    def _hold(self, task):
+        self._refreshing.add(task)
+        task.add_done_callback(self._refreshing.discard)
+
+    async def _refresh_table(self, table):
+        """Refresh a table's transforms in order, again while requests for
+        the table arrived during the pass."""
+        try:
+            while True:
+                self._table_refresh_pending.discard(table)
+                for name in self.refresh_transforms.get(table, ()):
+                    await self._refresh_transform(name)
+                if table not in self._table_refresh_pending:
+                    break
+        finally:
+            self._table_refresh_running.discard(table)
+            self._table_refresh_pending.discard(table)
+
+    async def _refresh_transform(self, name):
+        """Return once a refresh of ``name`` that started after this call has
+        ended (successful or not)."""
+        state = self._transform_refresh.get(name)
+        if state is None:
+            state = self._transform_refresh[name] = _TransformRefresh()
+        state.requested += 1
+        target = state.requested
+        if state.worker is None:
+            state.worker = asyncio.ensure_future(self._transform_worker(name, state))
+            self._hold(state.worker)
+        async with state.changed:
+            await state.changed.wait_for(lambda: state.completed >= target)
+
+    async def _transform_worker(self, name, state):
+        try:
+            while state.completed < state.requested:
+                if state.last is not None:
+                    gap = state.last + REFRESH_MIN_INTERVAL - time.monotonic()
+                    if gap > 0:
+                        await asyncio.sleep(gap)
+                covered = state.requested
+                await self._call_refresh(name)
+                state.last = time.monotonic()
+                async with state.changed:
+                    state.completed = covered
+                    state.changed.notify_all()
+        finally:
+            state.worker = None
+            if state.completed < state.requested:  # ended early: release the waiters
+                async with state.changed:
+                    state.completed = state.requested
+                    state.changed.notify_all()
+
+    async def _call_refresh(self, name):
+        """One ``refresh_transform(name)``; never raises."""
+        refresh = getattr(self.ironflock, "refresh_transform", None)
+        if refresh is None:
+            return
+        for attempt in (1, 2):
+            try:
+                await refresh(name)
+                return
+            except Exception as e:
+                if attempt == 1 and REFRESH_IN_PROGRESS in str(e):
+                    await asyncio.sleep(REFRESH_RETRY_DELAY)
+                    continue
+                print(f"refresh of transform {name} failed (its schedule still runs): {e}")
+                return
 
     async def _report_repair(self, table, payload, problems):
         """Tell the operator once an hour per asset, table and kind of repair."""
@@ -939,12 +1196,12 @@ class Collector:
         ``reassert_after``, so table retention never drops a live entity.
 
         Writes full rows, not identity-only ones: the content comes from the
-        in-memory catalog (kept current by the table subscription) and the
-        last status write, which keeps the rewrite correct on a platform
-        without carry-over merges too. Only rows nobody touched for days are
-        rewritten, so a concurrent edit is not plausibly reverted. Returns the
-        number of rows written; never raises — a failure is retried on the
-        next pass.
+        in-memory catalog (read at startup and kept current by the store) and
+        the last status write, which keeps the rewrite correct on a platform
+        without carry-over merges too. Both tables are the gateway's alone,
+        so a rewrite reverts nobody's edit. Requests a refresh of the
+        transforms over the tables written. Returns the number of rows
+        written; never raises — a failure is retried on the next pass.
         """
         if not self.store_data or self.ironflock is None:
             return 0
@@ -969,8 +1226,10 @@ class Collector:
                 print(f"keep-alive of {len(rows)} datapoint row(s) failed: {e}")
                 break
             for row, _ in chunk:
-                row["tsp"] = stamp  # until the subscription echoes the new row
+                row["tsp"] = stamp
             written += len(rows)
+        if written:
+            self.request_refresh("datapoints")
 
         monotonic_cutoff = time.monotonic() - self.reassert_after
         for asset_name, (when, status, detail) in list(self._status_written.items()):
@@ -1036,8 +1295,7 @@ class Collector:
         return provider
 
     def _datapoint_catalog(self, asset_name):
-        """Map ``datapoint_id`` -> live catalog row for one asset, used to read
-        the per-datapoint ``enabled`` / ``change_detection`` settings."""
+        """Map ``datapoint_id`` -> catalog row for one asset."""
         return {
             row.get("datapoint_id"): row
             for row in self.datapoints
@@ -1045,13 +1303,12 @@ class Collector:
         }
 
     def _with_demo_config(self, asset_name, datapoints):
-        """Datapoint dicts with the catalog's demo settings merged in.
+        """Datapoint dicts with the effective demo tuning merged in.
 
-        Demo tuning is edited on the board, so for a discovered catalog the
-        live row is the only place it exists — the adapter's resolved dicts
-        know nothing about it. The row also wins where both carry a value: an
-        adapter that resolves demo settings from its own spec has already
-        written them there, so the row is never staler.
+        Per column of ``DEMO_DATAPOINT_COLUMNS`` the user's
+        ``datapoint_settings`` value wins when it is not null, then the
+        catalog row's value (a default the adapter derived from its spec),
+        then whatever the adapter's resolved dict carries.
 
         Returns the originals untouched when there is nothing to merge, so the
         common (unconfigured) case allocates nothing per cycle.
@@ -1059,12 +1316,15 @@ class Collector:
         catalog = self._datapoint_catalog(asset_name)
         merged = []
         for datapoint in datapoints:
-            row = catalog.get(datapoint.get("id")) or {}
-            demo = {
-                column: row[column]
-                for column in DEMO_DATAPOINT_COLUMNS
-                if row.get(column) is not None
-            }
+            datapoint_id = datapoint.get("id")
+            settings = self.datapoint_settings.get((asset_name, datapoint_id)) or {}
+            row = catalog.get(datapoint_id) or {}
+            demo = {}
+            for column in DEMO_DATAPOINT_COLUMNS:
+                if settings.get(column) is not None:
+                    demo[column] = settings[column]
+                elif row.get(column) is not None:
+                    demo[column] = row[column]
             merged.append({**datapoint, **demo} if demo else datapoint)
         return merged
 
@@ -1081,15 +1341,15 @@ class Collector:
         for absent datapoints. An empty raw map writes nothing. Returns
         whether anything was published.
 
-        Each datapoint is gated by its catalog row: an explicit
+        Each datapoint is gated by its ``datapoint_settings`` row: an explicit
         ``enabled == False`` drops it (per-datapoint pause), and with
         ``change_detection`` set it is written only when its value differs from
-        the last published value. With both off the full snapshot is written as
-        before; when gating empties the row, nothing is sent.
+        the last published value. Without a row, or with both off, the full
+        snapshot is written; when gating empties the row, nothing is sent.
         """
         asset_name = asset["asset_name"]
         by_id = {dp["id"]: dp for dp in datapoints if dp.get("id")}
-        catalog = self._datapoint_catalog(asset_name)
+        settings = self.datapoint_settings
         payload = {
             "tsp": _now(),
             "asset_name": asset_name,
@@ -1100,7 +1360,7 @@ class Collector:
             datapoint = by_id.get(datapoint_id)
             if datapoint is None:
                 continue
-            meta = catalog.get(datapoint_id)
+            meta = settings.get((asset_name, datapoint_id))
             if meta is not None and meta.get("enabled") is False:
                 continue  # datapoint paused
             entry = self.adapter.make_entry(asset, datapoint, raw_value)
@@ -1193,26 +1453,21 @@ class Collector:
     async def run(self):
         _tolerate_unencodable_output()
         try:
-            # Subscribe before reading, so a settings row saved during startup
-            # is not lost; the read then applies only what is newer.
-            await self.ironflock.subscribe_to_table(
-                "gateways", self._handle_gateway_update()
-            )
-            await self.load_gateway()
-            try:
-                await self.adapter.apply_settings(self.gateway)
-            except Exception as e:
-                print(f"apply_settings failed, using adapter defaults: {e}")
-                await self.report_exception(
-                    e,
-                    level="warn",
-                    fallback_user_message="Gateway settings could not be applied; using defaults.",
-                )
+            # Each followed table is subscribed before it is read, so a row
+            # saved during startup is not lost; the read then applies only
+            # what is newer.
+            await self.load_gateway_settings()
+            await self._apply_adapter_settings(self.settings)
 
             self.datapoints = await self.load_datapoints()
             self.store = DatapointStore(
-                self.ironflock, self.device_key, self.datapoints, store_data=self.store_data
+                self.ironflock,
+                self.device_key,
+                self.datapoints,
+                store_data=self.store_data,
+                on_write=self.request_refresh,
             )
+            await self.load_datapoint_settings()
             await self.load_asset_configs()
 
             # Drains the offline buffer on reconnect even when no new data flows.

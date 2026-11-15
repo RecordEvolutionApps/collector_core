@@ -1,10 +1,10 @@
-"""Per-datapoint demo signals: the walk, the boolean state, and the catalog merge."""
+"""Per-datapoint demo signals: the walk, the boolean state, and the settings merge."""
 
 import random
 
 from collector_core.adapter import (
+    DATAPOINT_SETTINGS_COLUMNS,
     DEMO_DATAPOINT_COLUMNS,
-    USER_DATAPOINT_COLUMNS,
     ProtocolAdapter,
     ProtocolSession,
 )
@@ -121,7 +121,10 @@ def test_session_reuses_one_signal_so_the_walk_continues():
     assert session.demo_signal is session.demo_signal
 
 
-# --- catalog merge ---------------------------------------------------------
+# --- settings merge --------------------------------------------------------
+#
+# Effective demo tuning: the datapoint_settings value when it is not null, then
+# the catalog row's default, then the adapter's resolved dict.
 
 class _Adapter(ProtocolAdapter):
     async def prepare_datapoints(self, asset, store):
@@ -134,37 +137,60 @@ class _Adapter(ProtocolAdapter):
         return raw
 
 
-def _collector(rows):
+def _collector(catalog=(), settings=()):
     c = Collector(device_name="d", device_key=1, adapter=_Adapter())
-    c.datapoints[:] = rows
+    c.datapoints[:] = list(catalog)
+    for row in settings:
+        c.datapoint_settings[(row["asset_name"], row["datapoint_id"])] = row
     return c
 
 
-def test_catalog_demo_settings_reach_the_datapoints():
-    c = _collector([{"asset_name": "a1", "datapoint_id": "t",
-                     "demo_value": "75", "demo_variance": "2"}])
+def test_settings_demo_values_reach_the_datapoints():
+    c = _collector(settings=[{"asset_name": "a1", "datapoint_id": "t",
+                              "demo_value": "75", "demo_variance": "2"}])
     assert c._with_demo_config("a1", [dp("t")]) == [dp("t", demo_value="75", demo_variance="2")]
 
 
-def test_catalog_row_wins_over_the_adapters_resolved_value():
-    c = _collector([{"asset_name": "a1", "datapoint_id": "t", "demo_value": "80"}])
+def test_the_catalog_default_applies_without_a_setting():
+    c = _collector(catalog=[{"asset_name": "a1", "datapoint_id": "t",
+                             "demo_value": "20", "demo_variance": 1}])
+    assert c._with_demo_config("a1", [dp("t", demo_value=5)]) == [
+        dp("t", demo_value="20", demo_variance=1)
+    ]
+
+
+def test_settings_win_over_the_catalog_and_the_adapter_per_column():
+    c = _collector(
+        catalog=[{"asset_name": "a1", "datapoint_id": "t", "demo_value": "20", "demo_variance": 1}],
+        settings=[{"asset_name": "a1", "datapoint_id": "t", "demo_value": "80", "demo_variance": None}],
+    )
     merged = c._with_demo_config("a1", [dp("t", demo_value=75, demo_variance=2)])
-    # board edit wins; the variance the adapter resolved is untouched
+    # the board's value wins; its null variance falls back to the catalog's
+    assert merged[0]["demo_value"] == "80" and merged[0]["demo_variance"] == 1
+
+
+def test_the_adapters_value_stays_when_neither_table_sets_one():
+    c = _collector(settings=[{"asset_name": "a1", "datapoint_id": "t", "demo_value": "80"}])
+    merged = c._with_demo_config("a1", [dp("t", demo_value=75, demo_variance=2)])
     assert merged[0]["demo_value"] == "80" and merged[0]["demo_variance"] == 2
 
 
+def test_settings_of_another_asset_do_not_apply():
+    c = _collector(settings=[{"asset_name": "a2", "datapoint_id": "t", "demo_value": "80"}])
+    original = dp("t")
+    assert c._with_demo_config("a1", [original])[0] is original
+
+
 def test_unconfigured_datapoints_pass_through_untouched():
-    c = _collector([{"asset_name": "a1", "datapoint_id": "t", "demo_value": None}])
+    c = _collector(catalog=[{"asset_name": "a1", "datapoint_id": "t", "demo_value": None}],
+                   settings=[{"asset_name": "a1", "datapoint_id": "t", "demo_value": None}])
     original = dp("t")
     merged = c._with_demo_config("a1", [original, dp("other")])
     assert merged[0] is original and merged[1] is not None
-    c2 = _collector([])
-    assert c2._with_demo_config("a1", [original])[0] is original
+    assert _collector()._with_demo_config("a1", [original])[0] is original
 
 
 # --- contract --------------------------------------------------------------
 
-def test_demo_columns_are_preserved_across_rediscovery():
-    # they are user-owned: the store must carry them over when an adapter
-    # rewrites the catalog without them
-    assert set(DEMO_DATAPOINT_COLUMNS) <= set(USER_DATAPOINT_COLUMNS)
+def test_demo_columns_are_datapoint_settings():
+    assert set(DEMO_DATAPOINT_COLUMNS) <= set(DATAPOINT_SETTINGS_COLUMNS)

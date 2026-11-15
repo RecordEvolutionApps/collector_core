@@ -3,16 +3,32 @@
 The shared, protocol-agnostic core of the IronFlock data collector app family
 (MTConnect, Modbus, BACnet, IO-Link, OPC UA, Profinet).
 
-It owns the IronFlock side of every collector: gateway settings, asset and
-datapoint configuration with live table subscriptions, one collection task
-per asset (polled or protocol-pushed), measurements assembly, asset
-online/offline/paused state tracking, and data-write gating. Each collector
-app contributes only a protocol adapter and its platform templates.
+It owns the IronFlock side of every collector: the gateway's registration,
+following the users' gateway settings, assets and datapoint settings live,
+one collection task per asset (polled or protocol-pushed), the datapoints
+catalog, measurements assembly, asset online/offline/paused state tracking,
+data-write gating, and refreshing the app's transforms after its writes. Each
+collector app contributes only a protocol adapter and its platform templates.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the core contract, the data model
 and the per-protocol mapping. The canonical table structure every app must
 provide in its backend ships as
 [collector_core/data-template.yml](collector_core/data-template.yml).
+
+## Tables
+
+Seven tables, each with one writer (`gateway_id` is the gateway's
+`DEVICE_KEY` everywhere):
+
+| Table | Written by |
+|---|---|
+| `gateways` | the gateway about itself, at startup; the board writes only `{gateway_id, deleted: true}` |
+| `gateway_settings` | the board (per-gateway settings: `store_data`, `buffer_size`, app columns) |
+| `assets` | the board's forms and the AI assistant (config_core) |
+| `datapoints` | the gateway (the catalog) |
+| `datapoint_settings` | the board and the AI assistant (`enabled`, `change_detection`, demo tuning, `configured_by`) |
+| `measurements` | the gateway |
+| `assetstatus` | the gateway |
 
 ## Usage in a collector app
 
@@ -25,11 +41,65 @@ ironflock-collector-core @ git+https://github.com/RecordEvolutionApps/collector_
 from collector_core import Collector
 from protocols.myprotocol import MyAdapter
 
-collector = Collector(device_name=DEVICE_NAME, device_key=DEVICE_KEY, adapter=MyAdapter())
+collector = Collector(
+    device_name=DEVICE_NAME,
+    device_key=DEVICE_KEY,
+    adapter=MyAdapter(),
+    # optional: transforms to refresh after the core writes or applies a
+    # table, per table in bottom-up order (needs ironflock >= 1.11.0)
+    refresh_transforms={
+        "assetstatus": ["asset_status_counts", "asset_overview"],
+        "assets": ["asset_overview"],
+        "gateways": ["gateway_overview"],
+    },
+)
 ironflock = IronFlock(mainFunc=collector.run)
 collector.set_ironflock(ironflock)
 ironflock.run()
 ```
+
+Constructor arguments: `device_name`, `device_key`, `adapter`, `store_data`
+(default when `gateway_settings` sets none), `on_error`, `ports` (remote-access
+ports for the gateway's `url` column), `refresh_transforms`. An adapter that
+writes a table of its own maps it in `refresh_transforms` and calls
+`collector.request_refresh(table)` after writing.
+
+## Migrating from v2
+
+v3 splits the users' settings out of the tables the gateway writes. In the
+app:
+
+1. **Data template.** Take the seven tables from
+   [collector_core/data-template.yml](collector_core/data-template.yml):
+   - `gateways`: identity `maintainLatestFlagFor: [gateway_id]`, add
+     `gateway_id` (numeric), drop `store_data`, `buffer_size` and any app
+     settings columns.
+   - add `gateway_settings` (`gateway_id`, `store_data`, `buffer_size`) and
+     move the app's own per-gateway settings columns there (e.g.
+     `iodd_autofetch`).
+   - `datapoints`: drop `enabled` and `change_detection`; `demo_value` /
+     `demo_variance` stay as optional defaults the adapter derives.
+   - add `datapoint_settings` (`gateway_id`, `asset_name`, `datapoint_id`,
+     `enabled`, `change_detection`, `demo_value`, `demo_variance`,
+     `configured_by`), without `dropAfter`.
+2. **Board.** The gateway settings form writes `gateway_settings` with the
+   gateway's `gateway_id`. The gateway delete form writes `{gateway_id,
+   deleted: true}` to `gateways`. The datapoint form writes
+   `datapoint_settings` (`configured_by: "board"`); the AI assistant writes
+   the same table with `configured_by: "agent"`. Bindings that joined on
+   `gateways.gateway_name` join on `gateway_id`.
+3. **Code.** Pass `refresh_transforms` for the transforms the board shows.
+   `collector.gateway` is now `collector.settings` (the `gateway_settings`
+   row); `apply_settings` receives that row. `Collector.soft_delete_asset`,
+   `Collector.load_gateway` and `USER_DATAPOINT_COLUMNS` are gone
+   (`DATAPOINT_SETTINGS_COLUMNS` names the columns the core reads).
+   Incomplete asset rows are no longer deleted by the gateway: the user
+   deletes them on the board.
+4. **Data.** Existing per-gateway settings revert to their defaults once:
+   they lived in `gateways` keyed by `gateway_name`, and the core reads
+   `gateway_settings` keyed by `gateway_id`. Per-datapoint switches set in v2
+   lived in the catalog and revert the same way unless the app copies them
+   into `datapoint_settings`.
 
 ## Releasing a new version
 
@@ -64,6 +134,9 @@ The core declares **zero dependencies** — the `ironflock` SDK handle is inject
 by the app — but it does call methods on that handle. If a release starts using
 a newer SDK method, record the new minimum here and in the release notes so apps
 bump their own `ironflock` pin. **Current minimum: `ironflock >= 1.10.0`.**
+Apps that pass **`refresh_transforms`** need **`ironflock >= 1.11.0`** for
+`refresh_transform`; with an older SDK the core refreshes nothing (it says so
+once) and the transforms follow their schedule.
 From 1.9.0 the SDK rides out a platform restart in its table writes: a write
 waits up to the SDK's `reconnect_window` (60 s) for the connection and is
 retried while the data backend is not serving yet, so a router or data-backend
@@ -77,7 +150,7 @@ gateway `url` column's `cloud` URL comes straight from the SDK's
 
 The SDK does not hold rows beyond that window: a write still failing after it
 raises, and a write in flight when the link drops fails at once. The core's own
-bounded buffer (`gateways.buffer_size`) therefore stays the store for longer
+bounded buffer (`gateway_settings.buffer_size`) therefore stays the store for longer
 outages, and the outage report on recovery comes from it.
 
 ### Steps

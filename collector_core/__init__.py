@@ -4,9 +4,9 @@ See ARCHITECTURE.md for the full core contract and data model.
 """
 
 from collector_core.adapter import (
+    DATAPOINT_SETTINGS_COLUMNS,
     DEMO_DATAPOINT_COLUMNS,
     PLATFORM_COLUMNS,
-    USER_DATAPOINT_COLUMNS,
     DatapointsChanged,
     DatapointStore,
     ProtocolAdapter,
@@ -32,7 +32,7 @@ __all__ = [
     # DemoSignal; the columns are the per-datapoint contract behind it.
     "DemoSignal",
     "PLATFORM_COLUMNS",
-    "USER_DATAPOINT_COLUMNS",
+    "DATAPOINT_SETTINGS_COLUMNS",
     "DEMO_DATAPOINT_COLUMNS",
     # Error hierarchy — adapters raise these; the core reports them.
     "CollectorError",
